@@ -5,6 +5,9 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +56,13 @@ class IndexEntry:
 class ValidationIssue:
     kind: str
     path: str
+    detail: str
+
+
+@dataclass
+class DoctorCheck:
+    name: str
+    ok: bool
     detail: str
 
 
@@ -554,6 +564,99 @@ def command_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_doctor(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    checks: list[DoctorCheck] = []
+
+    py_ok = sys.version_info >= (3, 10)
+    checks.append(
+        DoctorCheck(
+            name="python_version",
+            ok=py_ok,
+            detail=f"detected {sys.version.split()[0]}, requires >=3.10",
+        )
+    )
+
+    script_ok = Path(__file__).exists()
+    checks.append(
+        DoctorCheck(
+            name="agent_memory_script",
+            ok=script_ok,
+            detail=str(Path(__file__).resolve()),
+        )
+    )
+
+    in_path = any(Path(part).expanduser() == Path.home() / ".local" / "bin" for part in os.environ.get("PATH", "").split(":"))
+    checks.append(
+        DoctorCheck(
+            name="local_bin_on_path",
+            ok=in_path,
+            detail="~/.local/bin present in PATH" if in_path else "~/.local/bin missing from PATH",
+        )
+    )
+
+    memlog_path = shutil.which("memlog")
+    checks.append(
+        DoctorCheck(
+            name="memlog_discoverable",
+            ok=bool(memlog_path),
+            detail=memlog_path or "memlog not found on PATH",
+        )
+    )
+
+    if memlog_path:
+        try:
+            result = subprocess.run(
+                [memlog_path, "load", "--root", str(root), "--source", "master", "--limit", "1"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            checks.append(
+                DoctorCheck(
+                    name="memlog_execution",
+                    ok=result.returncode == 0,
+                    detail="command executed" if result.returncode == 0 else (result.stderr.strip() or "execution failed"),
+                )
+            )
+        except OSError as exc:
+            checks.append(DoctorCheck(name="memlog_execution", ok=False, detail=str(exc)))
+
+    try:
+        ensure_layout(root)
+        checks.append(
+            DoctorCheck(
+                name="memory_layout_access",
+                ok=True,
+                detail=f"layout available at {root}",
+            )
+        )
+    except OSError as exc:
+        checks.append(DoctorCheck(name="memory_layout_access", ok=False, detail=str(exc)))
+
+    all_ok = all(check.ok for check in checks)
+    if args.format == "json":
+        print(
+            json.dumps(
+                {
+                    "ok": all_ok,
+                    "checks": [check.__dict__ for check in checks],
+                },
+                indent=2,
+            )
+        )
+    else:
+        status = "passed" if all_ok else "found issues"
+        print(f"Doctor {status}:")
+        for check in checks:
+            marker = "OK" if check.ok else "FAIL"
+            print(f"- {marker} {check.name}: {check.detail}")
+
+    if args.strict and not all_ok:
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AgentMemory markdown continuity logger")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -602,6 +705,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--strict", action="store_true", help="exit non-zero when issues are found")
     validate_parser.add_argument("--format", choices=["text", "json"], default="text")
     validate_parser.set_defaults(func=command_validate)
+
+    doctor_parser = subparsers.add_parser("doctor", help="check local installation and runtime wiring")
+    doctor_parser.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")
+    doctor_parser.add_argument("--strict", action="store_true", help="exit non-zero when checks fail")
+    doctor_parser.add_argument("--format", choices=["text", "json"], default="text")
+    doctor_parser.set_defaults(func=command_doctor)
 
     return parser
 

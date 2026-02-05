@@ -62,6 +62,12 @@ Validate links and orphan raw artifacts:
 python3 agent_memory.py validate --root ~/opencode --strict
 ```
 
+Run installation and runtime health checks:
+
+```bash
+python3 agent_memory.py doctor --root ~/opencode
+```
+
 ## Structure under `--root`
 
 - `memory/master.md`

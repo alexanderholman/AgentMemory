@@ -93,11 +93,23 @@ and independent verification on every reuse.
   a missing query or document embedding invokes the rung-3 specialist model.
   Child and deterministic scopes use lexical retrieval and cannot consume
   model-derived embedding caches.
-- Ollama is loopback-only by default. AgentMemory never starts Ollama, pulls a
-  model, follows redirects, uses environment proxies, or downloads implicitly.
+- Direct Ollama use is restricted to operator-evaluation scope and requires an
+  explicit loopback IP endpoint, model, and `local-private` embedding-cache
+  opt-in on each CLI invocation. AgentMemory never reads provider environment
+  defaults, starts Ollama, pulls a model, follows redirects, uses environment
+  proxies, or downloads implicitly.
 - A provider failure cannot weaken security policy. Semantic mode fails closed;
   hybrid may degrade to text only when the caller explicitly requests that
   behavior and receives a visible degradation result.
+
+The search CLI keeps `--mode auto|index|scan` as the lexical backend selector.
+The separate `--retrieval text|semantic|hybrid` selector defaults to `text`.
+Semantic and hybrid JSON responses use a `RetrievalOutcome` containing the
+requested and effective modes, degradation state and fixed reason code,
+provider fingerprint digest, and results. Default text JSON remains a bare
+result array for compatibility.
+Hybrid fetch depth is `RRF k + 2 × result limit`; the CLI caps the result limit
+at 470 so both rankings remain within the 1000-candidate validation bound.
 
 ## Ranking and validation
 

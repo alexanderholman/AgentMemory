@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1121,3 +1122,141 @@ def test_sync_rejects_root_replacement_during_discovery(
     monkeypatch.setattr(agent_memory, "_discover_index_documents", replace_after_discovery)
     with pytest.raises(ValueError, match="project root changed"):
         agent_memory.sync_memory_index(root)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("http://127.0.0.1:11434", "http://127.0.0.1:11434"),
+        ("http://[::1]:11434/", "http://[::1]:11434"),
+    ],
+)
+def test_ollama_endpoint_accepts_canonical_loopback_literals(
+    endpoint: str, expected: str
+) -> None:
+    assert agent_memory.validate_ollama_endpoint(endpoint) == expected
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://127.0.0.1:11434",
+        "http://localhost:11434",
+        "http://192.168.1.2:11434",
+        "http://127.0.0.1",
+        "http://user@127.0.0.1:11434",
+        "http://127.0.0.1:11434/api",
+        "http://127.0.0.1:11434?query=yes",
+        "http://127.0.0.1:11434#fragment",
+        "http://2130706433:11434",
+    ],
+)
+def test_ollama_endpoint_rejects_unsafe_or_ambiguous_urls(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        agent_memory.validate_ollama_endpoint(endpoint)
+
+
+def test_provider_fingerprint_is_stable_and_identity_complete() -> None:
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="nomic-embed-text:v1.5",
+        model_digest="sha256:abc123",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+
+    assert identity.digest() == replace(identity).digest()
+    for field, changed in (
+        ("provider", "other"),
+        ("endpoint", "http://127.0.0.1:11435"),
+        ("model", "other-model"),
+        ("model_digest", "sha256:def456"),
+        ("server_version", "0.11.5"),
+        ("document_prefix", "doc: "),
+        ("query_prefix", "query: "),
+        ("chunker_version", "canonical-fields-v2"),
+    ):
+        assert replace(identity, **{field: changed}).digest() != identity.digest()
+
+
+@pytest.mark.parametrize("field", ["model_digest", "server_version"])
+def test_provider_fingerprint_rejects_missing_reported_identity(field: str) -> None:
+    values = {
+        "provider": "ollama",
+        "endpoint": "http://127.0.0.1:11434",
+        "model": "nomic-embed-text:v1.5",
+        "model_digest": "sha256:abc123",
+        "server_version": "0.11.4",
+        "document_prefix": "search_document: ",
+        "query_prefix": "search_query: ",
+        "chunker_version": "canonical-fields-v1",
+    }
+    values[field] = ""
+    with pytest.raises(ValueError, match=field.replace("_", " ")):
+        agent_memory.ProviderFingerprint(**values)
+
+
+def test_ollama_config_requires_explicit_loopback_endpoint_and_model() -> None:
+    config = agent_memory.OllamaConfig(
+        endpoint="http://127.0.0.1:11434/",
+        model="nomic-embed-text:v1.5",
+    )
+    assert config.endpoint == "http://127.0.0.1:11434"
+    assert config.model == "nomic-embed-text:v1.5"
+
+    with pytest.raises(ValueError, match="model"):
+        agent_memory.OllamaConfig(endpoint="http://127.0.0.1:11434", model="")
+    with pytest.raises(ValueError, match="loopback"):
+        agent_memory.OllamaConfig(endpoint="http://ollama.local:11434", model="model")
+
+
+def test_discover_ollama_fingerprint_uses_reported_version_and_model_digest() -> None:
+    calls = []
+
+    def request_json(method: str, url: str, payload: dict | None, **limits):
+        calls.append((method, url, payload, limits))
+        if url.endswith("/api/version"):
+            return {"version": "0.11.4"}
+        return {
+            "models": [
+                {"name": "other:latest", "digest": "sha256:other"},
+                {"name": "nomic-embed-text:v1.5", "digest": "sha256:expected"},
+            ]
+        }
+
+    config = agent_memory.OllamaConfig(
+        endpoint="http://127.0.0.1:11434",
+        model="nomic-embed-text:v1.5",
+    )
+    fingerprint = agent_memory.discover_ollama_fingerprint(config, request_json=request_json)
+
+    assert fingerprint.server_version == "0.11.4"
+    assert fingerprint.model_digest == "sha256:expected"
+    assert [(call[0], call[1], call[2]) for call in calls] == [
+        ("GET", "http://127.0.0.1:11434/api/version", None),
+        ("GET", "http://127.0.0.1:11434/api/tags", None),
+    ]
+    assert all(call[3] == {"timeout": 10.0, "max_bytes": 8_000_000} for call in calls)
+
+
+def test_ollama_http_opener_disables_proxies_and_redirects() -> None:
+    opener = agent_memory._build_ollama_opener()
+    redirect_handler = next(
+        handler
+        for handler in opener.handlers
+        if isinstance(handler, agent_memory._RejectRedirects)
+    )
+
+    assert not any(isinstance(handler, agent_memory.ProxyHandler) for handler in opener.handlers)
+    with pytest.raises(agent_memory.HTTPError):
+        redirect_handler.redirect_request(
+            None,
+            None,
+            302,
+            "redirect",
+            {},
+            "http://127.0.0.1:11434/elsewhere",
+        )

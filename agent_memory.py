@@ -3,6 +3,7 @@
 import argparse
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -15,6 +16,10 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+from urllib.error import HTTPError
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 try:
     import fcntl
@@ -112,6 +117,99 @@ class SearchResult:
         }
 
 
+@dataclass(frozen=True)
+class ProviderFingerprint:
+    provider: str
+    endpoint: str
+    model: str
+    model_digest: str
+    server_version: str
+    document_prefix: str
+    query_prefix: str
+    chunker_version: str
+
+    def __post_init__(self) -> None:
+        if not self.model_digest:
+            raise ValueError("model digest is required")
+        if not self.server_version:
+            raise ValueError("server version is required")
+
+    def digest(self) -> str:
+        payload = [
+            self.provider,
+            self.endpoint,
+            self.model,
+            self.model_digest,
+            self.server_version,
+            self.document_prefix,
+            self.query_prefix,
+            self.chunker_version,
+        ]
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class OllamaConfig:
+    endpoint: str
+    model: str
+    document_prefix: str = "search_document: "
+    query_prefix: str = "search_query: "
+    chunker_version: str = "canonical-fields-v1"
+    timeout_seconds: float = 10.0
+    max_response_bytes: int = 8_000_000
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "endpoint", validate_ollama_endpoint(self.endpoint))
+        if not self.model or len(self.model) > 500 or re.search(r"[\x00-\x1f\x7f]", self.model):
+            raise ValueError("Ollama model must be an explicit bounded single-line value")
+
+
+def discover_ollama_fingerprint(
+    config: OllamaConfig,
+    *,
+    request_json: Callable[..., object],
+) -> ProviderFingerprint:
+    request_limits = {
+        "timeout": config.timeout_seconds,
+        "max_bytes": config.max_response_bytes,
+    }
+    version_payload = request_json(
+        "GET", f"{config.endpoint}/api/version", None, **request_limits
+    )
+    tags_payload = request_json("GET", f"{config.endpoint}/api/tags", None, **request_limits)
+    if not isinstance(version_payload, dict) or not isinstance(version_payload.get("version"), str):
+        raise ValueError("Ollama server version is missing or malformed")
+    if not isinstance(tags_payload, dict) or not isinstance(tags_payload.get("models"), list):
+        raise ValueError("Ollama model inventory is missing or malformed")
+    model_digest = None
+    for model in tags_payload["models"]:
+        if isinstance(model, dict) and model.get("name") == config.model:
+            model_digest = model.get("digest")
+            break
+    if not isinstance(model_digest, str) or not model_digest:
+        raise ValueError("configured Ollama model digest is unavailable")
+    return ProviderFingerprint(
+        provider="ollama",
+        endpoint=config.endpoint,
+        model=config.model,
+        model_digest=model_digest,
+        server_version=version_payload["version"],
+        document_prefix=config.document_prefix,
+        query_prefix=config.query_prefix,
+        chunker_version=config.chunker_version,
+    )
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(newurl, code, "Ollama redirects are disabled", headers, fp)
+
+
+def _build_ollama_opener():
+    return build_opener(ProxyHandler({}), _RejectRedirects())
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -149,6 +247,33 @@ def validate_metadata_scalar(value: str, label: str) -> str:
     if not value or len(value) > 500 or re.search(r"[\x00-\x1f\x7f]", value):
         raise ValueError(f"{label} must be a bounded single-line value")
     return value
+
+
+def validate_ollama_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Ollama endpoint must be an explicit loopback HTTP URL with a port") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname is None
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Ollama endpoint must be an explicit loopback HTTP URL with a port")
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError as exc:
+        raise ValueError("Ollama endpoint must use a loopback IP literal") from exc
+    if not address.is_loopback:
+        raise ValueError("Ollama endpoint must use a loopback IP literal")
+    host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return urlunsplit(("http", f"{host}:{port}", "", "", ""))
 
 
 def parse_timestamp(value: str, label: str = "timestamp") -> dt.datetime:

@@ -270,9 +270,6 @@ def redact_text(content: str) -> tuple[str, bool]:
 
     def redact_entropy_match(match: re.Match) -> str:
         nonlocal touched
-        token = match.group(0)
-        if token.count("-") >= 4:
-            return token
         touched = True
         return "[REDACTED_TOKEN]"
 
@@ -306,11 +303,20 @@ def _generated_tool_boundary(text: str) -> int | None:
 
 
 def parse_memory_sections(body: str) -> tuple[str, str]:
-    summary_marker = "## Summary\n"
+    links_marker = "\n## Links\n"
+    summary_marker = "\n## Summary\n"
     full_message_marker = "\n## Full Message\n"
-    if summary_marker not in body:
-        return "", ""
-    content = body.split(summary_marker, 1)[1]
+    offset = 0
+    content = ""
+    while True:
+        links_boundary = body.find(links_marker, offset)
+        if links_boundary < 0:
+            return "", ""
+        following = body[links_boundary + len(links_marker) :]
+        if following.startswith("- master: [[memory/master]]") and summary_marker in following:
+            content = following.split(summary_marker, 1)[1]
+            break
+        offset = links_boundary + len(links_marker)
     tool_boundary = _generated_tool_boundary(content)
     if tool_boundary is None:
         return "", ""
@@ -654,6 +660,7 @@ def command_log(args: argparse.Namespace) -> int:
         previous_link = wiki_link(root / state["last_event"], root)
 
     title, title_masked = redact_text(args.title or f"{event_type} from {agent_name}")
+    title = single_line_text(title, max_chars=200)
     summary_text, summary_masked = redact_text(
         args.summary or summarize(message_redacted, max_lines=3, max_chars=280)
     )

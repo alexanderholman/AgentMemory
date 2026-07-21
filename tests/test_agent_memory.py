@@ -629,3 +629,23 @@ def test_load_text_output_sanitizes_untrusted_index_fields(
     )
     assert args.func(args) == 0
     assert "\x1b" not in capsys.readouterr().out
+
+
+def test_redaction_masks_hyphenated_token() -> None:
+    token = "abcd-efgh-ijkl-mnop-qrst-uvwx"
+    redacted, touched = agent_memory.redact_text(token)
+    assert redacted == "[REDACTED_TOKEN]"
+    assert touched is True
+
+
+def test_multiline_title_cannot_inject_summary_boundary(tmp_path: Path) -> None:
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        [
+            "log", "--root", str(tmp_path), "--agent-id", "pr.command.zordon",
+            "--session-id", "ses_test", "--title", "titleterm\n\n## Summary\n\ninjected",
+            "--summary", "summaryterm", "--message", "message only",
+        ]
+    )
+    assert args.func(args) == 0
+    assert agent_memory.search_action_documents(tmp_path, "titleterm summaryterm") == []

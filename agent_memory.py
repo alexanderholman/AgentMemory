@@ -265,18 +265,21 @@ def redact_text(content: str) -> tuple[str, bool]:
 
     # Avoid destroying useful memory such as paths and long identifiers. Only
     # mask long values that contain characters commonly present in secrets.
-    entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{32,}\b")
-    matches = set(entropy_like.findall(redacted))
-    for token in matches:
+    entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{24,}\b")
+
+    def redact_entropy_match(match: re.Match) -> str:
+        nonlocal touched
+        token = match.group(0)
         if token.count("-") >= 4:
-            continue
-        if re.fullmatch(r"[A-Za-z]+", token):
-            if re.fullmatch(r"[A-Z][a-z]+(?:[A-Z][A-Za-z]+)+", token):
-                continue
-        elif not re.search(r"[0-9+=_]", token):
-            continue
-        redacted = redacted.replace(token, "[REDACTED_TOKEN]")
+            return token
+        before = redacted[match.start() - 1] if match.start() else ""
+        after = redacted[match.end()] if match.end() < len(redacted) else ""
+        if before == "/" or after == "/" or (before == "`" and after == "`"):
+            return token
         touched = True
+        return "[REDACTED_TOKEN]"
+
+    redacted = entropy_like.sub(redact_entropy_match, redacted)
 
     return redacted, touched
 
@@ -297,6 +300,19 @@ def _section(text: str, heading: str, end_heading: str) -> str:
     end_marker = f"\n## {end_heading}\n"
     if end_marker not in content:
         return ""
+    if end_heading == "Tool Outputs (summarized)":
+        offset = 0
+        while True:
+            boundary = content.find(end_marker, offset)
+            if boundary < 0:
+                return ""
+            following = content[boundary + len(end_marker) :]
+            if (
+                (following.startswith("- none") or following.startswith("- tool:"))
+                and "\n## Raw Output Links\n" in following
+            ):
+                return content[:boundary].strip()
+            offset = boundary + len(end_marker)
     return content.split(end_marker, 1)[0].strip()
 
 
@@ -696,6 +712,18 @@ def command_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def canonical_action_preview(entry: IndexEntry, root: Path, max_chars: int) -> tuple[Path | None, str | None, str | None]:
+    try:
+        action_path = link_to_path(entry.action_link, root)
+        if action_path.suffix != ".md":
+            raise ValueError("action link does not reference canonical Markdown")
+        parse_action_document(action_path, root)
+        text, _, _ = read_canonical_file(action_path, root, 1_000_000)
+        return action_path, summarize(text, max_lines=12, max_chars=max_chars), None
+    except (OSError, UnicodeError, ValueError) as exc:
+        return None, None, f"unsafe action link: {exc}"
+
+
 def command_load(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     ensure_layout(root)
@@ -706,7 +734,8 @@ def command_load(args: argparse.Namespace) -> int:
     elif source == "agent":
         if not args.agent_id:
             raise SystemExit("--agent-id is required when --source agent")
-        path = root / "memory" / "agents" / f"{validate_identifier(args.agent_id, 'agent id')}.md"
+        requested_agent = validate_identifier(args.agent_id, "agent id")
+        path = root / "memory" / "agents" / f"{requested_agent}.md"
     else:
         if not args.session_id:
             raise SystemExit("--session-id is required when --source session")
@@ -719,6 +748,8 @@ def command_load(args: argparse.Namespace) -> int:
         entries = []
         seen_memory_uuids: set[str] = set()
         for entry in canonical_entries + master_entries:
+            if entry.agent != requested_agent:
+                continue
             if entry.memory_uuid in seen_memory_uuids:
                 continue
             entries.append(entry)
@@ -753,10 +784,12 @@ def command_load(args: argparse.Namespace) -> int:
                 "summary": entry.summary,
             }
             if args.with_action:
-                action_path = link_to_path(entry.action_link, root)
-                row["action_path"] = action_path.as_posix()
-                if action_path.exists():
-                    row["action_preview"] = summarize(action_path.read_text(encoding="utf-8"), max_lines=12, max_chars=1600)
+                action_path, preview, error = canonical_action_preview(entry, root, 1600)
+                if action_path and preview:
+                    row["action_path"] = action_path.as_posix()
+                    row["action_preview"] = preview
+                else:
+                    row["action_error"] = error
             payload.append(row)
         print(json.dumps(payload, indent=2))
         return 0
@@ -767,13 +800,12 @@ def command_load(args: argparse.Namespace) -> int:
             f"{entry.session} | {entry.event_type} | {entry.action_link} | {entry.summary}"
         )
         if args.with_action:
-            action_path = link_to_path(entry.action_link, root)
-            if action_path.exists():
-                preview = summarize(action_path.read_text(encoding='utf-8'), max_lines=12, max_chars=1200)
+            action_path, preview, error = canonical_action_preview(entry, root, 1200)
+            if action_path and preview:
                 print(f"  action: {action_path}")
                 print(f"  preview: {preview}")
             else:
-                print(f"  action: missing ({action_path})")
+                print(f"  action: rejected ({error})")
 
     return 0
 

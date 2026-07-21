@@ -447,7 +447,7 @@ def test_search_skips_document_with_invalid_timestamp(tmp_path: Path) -> None:
 
 
 def test_redaction_preserves_long_alphabetic_identifiers() -> None:
-    identifier = "AgentMemoryCanonicalIdentifierName"
+    identifier = "`AgentMemoryCanonicalIdentifierName`"
     redacted, touched = agent_memory.redact_text(identifier)
     assert redacted == identifier
     assert touched is False
@@ -521,3 +521,79 @@ def test_search_text_output_sanitizes_control_characters_in_path(
     output = capsys.readouterr().out
     assert "\x1b" not in output
     assert "\nFORGED" not in output
+
+
+def test_redaction_masks_30_character_token() -> None:
+    token = "abcDEF0123456789abcDEF01234567"
+    redacted, touched = agent_memory.redact_text(token)
+    assert redacted == "[REDACTED_TOKEN]"
+    assert touched is True
+
+
+def test_redaction_preserves_long_path_segment() -> None:
+    path = "/home/user/AgentMemoryCanonicalIdentifierName/file.md"
+    redacted, touched = agent_memory.redact_text(path)
+    assert redacted == path
+    assert touched is False
+
+
+def test_agent_load_filters_before_deduplicating_master_entries(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    agent_dir = tmp_path / "memory" / "agents"
+    agent_dir.mkdir(parents=True)
+    master = tmp_path / "memory" / "master.md"
+    master.write_text(
+        "# Master Memory\n\n"
+        "- 2026-07-21T12:00:00Z | memory_uuid: `shared` | agent: `other.agent` | "
+        "session: `other` | type: `message` | [[actions/other]] | other\n"
+        "- 2026-07-21T12:01:00Z | memory_uuid: `shared` | agent: `pr.command.zordon` | "
+        "session: `wanted` | type: `message` | [[actions/wanted]] | wanted\n",
+        encoding="utf-8",
+    )
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        ["load", "--root", str(tmp_path), "--source", "agent", "--agent-id", "pr.command.zordon", "--format", "json"]
+    )
+
+    assert args.func(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["session"] == "wanted"
+
+
+def test_agent_load_never_previews_raw_artifacts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = tmp_path / "actions" / "2026" / "07" / "raw" / "secret.raw"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("RAW_SECRET_VALUE", encoding="utf-8")
+    agent_dir = tmp_path / "memory" / "agents"
+    agent_dir.mkdir(parents=True)
+    (tmp_path / "memory" / "master.md").write_text(
+        "# Master Memory\n\n"
+        "- 2026-07-21T12:00:00Z | memory_uuid: `raw-link` | agent: `pr.command.zordon` | "
+        "session: `ses_test` | type: `message` | [[actions/2026/07/raw/secret.raw]] | unsafe\n",
+        encoding="utf-8",
+    )
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        [
+            "load", "--root", str(tmp_path), "--source", "agent", "--agent-id", "pr.command.zordon",
+            "--with-action", "--format", "json",
+        ]
+    )
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "RAW_SECRET_VALUE" not in output
+    assert "unsafe action link" in output
+
+
+def test_search_preserves_legacy_reserved_heading_inside_message(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="legacy-heading-id",
+        message="before\n\n## Tool Outputs (summarized)\n\nlegacy needle after heading",
+    )
+    results = agent_memory.search_action_documents(tmp_path, "legacy needle")
+    assert results[0].memory_uuid == "legacy-heading-id"

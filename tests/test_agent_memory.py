@@ -1,4 +1,6 @@
 import json
+import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -663,3 +665,311 @@ def test_log_rejects_multiline_front_matter_values(tmp_path: Path, option: str) 
     )
     with pytest.raises(ValueError, match="single-line"):
         args.func(args)
+
+
+def test_index_sync_adds_updates_and_removes_canonical_documents(tmp_path: Path) -> None:
+    first = write_action(tmp_path, memory_uuid="first-id", message="first indexed memory")
+    write_action(tmp_path, memory_uuid="second-id", message="second indexed memory")
+
+    initial = agent_memory.sync_memory_index(tmp_path)
+    assert initial == {"added": 2, "updated": 0, "removed": 0, "unchanged": 0, "recovered": False}
+    assert agent_memory.memory_index_status(tmp_path)["document_count"] == 2
+
+    unchanged = agent_memory.sync_memory_index(tmp_path)
+    assert unchanged["unchanged"] == 2
+
+    first.write_text(first.read_text(encoding="utf-8").replace("first indexed", "updated indexed"), encoding="utf-8")
+    (tmp_path / "actions" / "2026" / "07" / "event-second-id.md").unlink()
+    changed = agent_memory.sync_memory_index(tmp_path)
+    assert changed["updated"] == 1
+    assert changed["removed"] == 1
+    assert agent_memory.memory_index_status(tmp_path)["document_count"] == 1
+
+
+def test_indexed_search_matches_filters_and_excludes_raw(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="indexed-id",
+        agent_id="pr.command.zordon",
+        session_id="ses_indexed",
+        event_type="checkpoint",
+        message="durable sqlite retrieval",
+    )
+    raw = tmp_path / "actions" / "2026" / "07" / "raw" / "secret.raw"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("sqlite secret", encoding="utf-8")
+    agent_memory.sync_memory_index(tmp_path)
+
+    results = agent_memory.search_indexed_documents(
+        tmp_path,
+        "sqlite retrieval",
+        agent_id="pr.command.zordon",
+        session_id="ses_indexed",
+        event_type="checkpoint",
+    )
+
+    assert [result.memory_uuid for result in results] == ["indexed-id"]
+    assert all("secret.raw" not in result.relative_path for result in results)
+
+
+def test_auto_search_falls_back_when_index_is_missing_or_corrupt(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="fallback-id", message="fallback memory")
+    assert agent_memory.search_memories(tmp_path, "fallback", mode="auto")[0].memory_uuid == "fallback-id"
+
+    index_path = agent_memory.memory_index_path(tmp_path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_bytes(b"not sqlite")
+    assert agent_memory.search_memories(tmp_path, "fallback", mode="auto")[0].memory_uuid == "fallback-id"
+
+
+def test_index_sync_recovers_from_corruption(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="recover-id", message="recoverable memory")
+    index_path = agent_memory.memory_index_path(tmp_path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_bytes(b"not sqlite")
+
+    result = agent_memory.sync_memory_index(tmp_path)
+
+    assert result["recovered"] is True
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is True
+    assert agent_memory.search_indexed_documents(tmp_path, "recoverable")[0].memory_uuid == "recover-id"
+
+
+def test_index_cli_sync_status_and_rebuild(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    write_action(tmp_path, memory_uuid="cli-index-id", message="cli indexed memory")
+    parser = agent_memory.build_parser()
+
+    sync_args = parser.parse_args(["index", "sync", "--root", str(tmp_path), "--format", "json"])
+    assert sync_args.func(sync_args) == 0
+    assert json.loads(capsys.readouterr().out)["added"] == 1
+
+    status_args = parser.parse_args(["index", "status", "--root", str(tmp_path), "--format", "json"])
+    assert status_args.func(status_args) == 0
+    assert json.loads(capsys.readouterr().out)["document_count"] == 1
+
+    rebuild_args = parser.parse_args(["index", "rebuild", "--root", str(tmp_path), "--format", "json"])
+    assert rebuild_args.func(rebuild_args) == 0
+    assert json.loads(capsys.readouterr().out)["added"] == 1
+
+
+def test_auto_search_synchronizes_a_healthy_stale_index(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="existing-id", message="existing memory")
+    agent_memory.sync_memory_index(tmp_path)
+    write_action(tmp_path, memory_uuid="new-id", message="newly logged memory")
+    assert agent_memory.search_memories(tmp_path, "newly logged", mode="auto")[0].memory_uuid == "new-id"
+
+
+def test_indexed_search_matches_unicode_casefold_semantics(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="unicode-id", message="Straße memory")
+    agent_memory.sync_memory_index(tmp_path)
+    assert agent_memory.search_indexed_documents(tmp_path, "strasse")[0].memory_uuid == "unicode-id"
+
+
+def test_index_status_and_sync_detect_missing_fts_rows(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="drift-id", message="drift memory")
+    agent_memory.sync_memory_index(tmp_path)
+    with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+        connection.execute("DELETE FROM documents_fts WHERE memory_uuid = 'drift-id'")
+        connection.commit()
+
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is False
+    repaired = agent_memory.sync_memory_index(tmp_path)
+    assert repaired["updated"] == 1
+    assert agent_memory.search_indexed_documents(tmp_path, "drift")[0].memory_uuid == "drift-id"
+
+
+def test_indexed_search_rejects_reversed_time_range(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="time-id", message="time memory")
+    agent_memory.sync_memory_index(tmp_path)
+    with pytest.raises(ValueError, match="since timestamp must not be after"):
+        agent_memory.search_indexed_documents(
+            tmp_path,
+            "time",
+            since="2026-07-22T00:00:00Z",
+            until="2026-07-21T00:00:00Z",
+        )
+
+
+def test_index_rejects_symlinked_state_directory(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-index-state"
+    outside.mkdir()
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / ".state").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        agent_memory.sync_memory_index(tmp_path)
+    assert list(outside.iterdir()) == []
+
+
+def test_index_rejects_hardlinked_database(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="hardlink-id", message="hardlink memory")
+    agent_memory.sync_memory_index(tmp_path)
+    index_path = agent_memory.memory_index_path(tmp_path)
+    other = tmp_path / "other.sqlite3"
+    os.link(index_path, other)
+    with pytest.raises(ValueError, match="hardlink"):
+        agent_memory.sync_memory_index(tmp_path)
+
+
+def test_index_paths_with_uri_characters_work(tmp_path: Path) -> None:
+    root = tmp_path / "project?#name"
+    write_action(root, memory_uuid="uri-id", message="uri path memory")
+    agent_memory.sync_memory_index(root)
+    assert agent_memory.memory_index_status(root)["ok"] is True
+    assert agent_memory.search_indexed_documents(root, "uri path")[0].memory_uuid == "uri-id"
+
+
+def test_lock_contention_does_not_delete_healthy_index(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="locked-id", message="locked memory")
+    agent_memory.sync_memory_index(tmp_path)
+    index_path = agent_memory.memory_index_path(tmp_path)
+    connection = sqlite3.connect(index_path)
+    connection.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            agent_memory.sync_memory_index(tmp_path)
+        assert index_path.exists()
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_index_filters_before_result_truncation(tmp_path: Path) -> None:
+    agent_memory.sync_memory_index(tmp_path)
+    with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+        ordinary = []
+        for index in range(5001):
+            row = (
+                f"ordinary-{index}", f"actions/{index}.md", f"hash-{index}",
+                "2026-07-21T12:00:00Z", "other.agent", "ses_other", "message",
+                "", "", "needle",
+            )
+            row_hash = agent_memory._indexed_row_hash(
+                (row[2], row[1], *row[3:])
+            )
+            ordinary.append((*row, row_hash))
+        connection.executemany(
+            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ordinary
+        )
+        connection.executemany(
+            "INSERT INTO documents_fts(memory_uuid, title, summary, message) VALUES (?, '', '', 'needle')",
+            [(row[0],) for row in ordinary],
+        )
+        target_base = (
+            "target-id", "actions/target.md", "target-hash", "2026-07-21T12:01:00Z",
+            "pr.command.zordon", "ses_target", "message", "", "", "needle",
+        )
+        target = (
+            *target_base,
+            agent_memory._indexed_row_hash((target_base[2], target_base[1], *target_base[3:])),
+        )
+        connection.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", target)
+        connection.execute(
+            "INSERT INTO documents_fts(memory_uuid, title, summary, message) VALUES (?, '', '', 'needle')",
+            (target[0],),
+        )
+        connection.commit()
+
+    results = agent_memory.search_indexed_documents(
+        tmp_path, "needle", agent_id="pr.command.zordon"
+    )
+    assert [result.memory_uuid for result in results] == ["target-id"]
+
+
+def test_index_file_is_private(tmp_path: Path) -> None:
+    agent_memory.sync_memory_index(tmp_path)
+    mode = agent_memory.memory_index_path(tmp_path).stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_sync_repairs_modified_and_orphaned_fts_payloads(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="payload-id", message="canonical payload memory")
+    agent_memory.sync_memory_index(tmp_path)
+    with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+        connection.execute(
+            "UPDATE documents_fts SET message = 'tampered' WHERE memory_uuid = 'payload-id'"
+        )
+        connection.execute(
+            "INSERT INTO documents_fts(memory_uuid, title, summary, message) VALUES ('orphan', '', '', 'orphan')"
+        )
+        connection.commit()
+
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is False
+    repaired = agent_memory.sync_memory_index(tmp_path)
+    assert repaired["updated"] == 1
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is True
+    assert agent_memory.search_indexed_documents(tmp_path, "canonical payload")[0].memory_uuid == "payload-id"
+
+
+def test_indexed_search_handles_underscore_tokens_like_scan(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="underscore-id", message="literal _ marker")
+    agent_memory.sync_memory_index(tmp_path)
+    indexed = agent_memory.search_indexed_documents(tmp_path, "_")
+    scanned = agent_memory.search_action_documents(tmp_path, "_")
+    assert [item.memory_uuid for item in indexed] == [item.memory_uuid for item in scanned]
+
+
+def test_explicit_index_search_rejects_symlinked_state_directory(tmp_path: Path) -> None:
+    external_root = tmp_path / "external"
+    write_action(external_root, memory_uuid="external-id", message="external secret memory")
+    agent_memory.sync_memory_index(external_root)
+    local_root = tmp_path / "local"
+    (local_root / "memory").mkdir(parents=True)
+    (local_root / "memory" / ".state").symlink_to(
+        external_root / "memory" / ".state", target_is_directory=True
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        agent_memory.search_indexed_documents(local_root, "external secret")
+
+
+def test_sync_repairs_relational_document_drift(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="row-drift-id",
+        agent_id="pr.command.zordon",
+        message="relational drift memory",
+    )
+    agent_memory.sync_memory_index(tmp_path)
+    with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+        connection.execute(
+            "UPDATE documents SET agent = 'tampered.agent', title = 'tampered' "
+            "WHERE memory_uuid = 'row-drift-id'"
+        )
+        connection.commit()
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is False
+    repaired = agent_memory.sync_memory_index(tmp_path)
+    assert repaired["updated"] == 1
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is True
+    assert agent_memory.search_indexed_documents(
+        tmp_path, "relational drift", agent_id="pr.command.zordon"
+    )[0].memory_uuid == "row-drift-id"
+
+
+def test_indexed_search_falls_back_for_non_fts_word_characters(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="unicode-word-id", message="marker ᦰ memory")
+    agent_memory.sync_memory_index(tmp_path)
+    indexed = agent_memory.search_indexed_documents(tmp_path, "ᦰ")
+    scanned = agent_memory.search_action_documents(tmp_path, "ᦰ")
+    assert [item.memory_uuid for item in indexed] == [item.memory_uuid for item in scanned]
+
+
+def test_fts_uses_python_word_boundaries_for_ascii_queries(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="boundary-id", message="needle\uE000 marker")
+    agent_memory.sync_memory_index(tmp_path)
+    indexed = agent_memory.search_indexed_documents(tmp_path, "needle")
+    scanned = agent_memory.search_action_documents(tmp_path, "needle")
+    assert [item.memory_uuid for item in indexed] == [item.memory_uuid for item in scanned]
+
+
+def test_status_and_sync_recover_fts_internal_corruption(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="fts-corrupt-id", message="fts corruption memory")
+    agent_memory.sync_memory_index(tmp_path)
+    with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+        connection.execute(
+            "DELETE FROM documents_fts_data WHERE id = (SELECT MAX(id) FROM documents_fts_data)"
+        )
+        connection.commit()
+    assert agent_memory.memory_index_status(tmp_path)["ok"] is False
+    repaired = agent_memory.sync_memory_index(tmp_path)
+    assert repaired["recovered"] is True
+    assert agent_memory.search_indexed_documents(tmp_path, "fts corruption")[0].memory_uuid == "fts-corrupt-id"

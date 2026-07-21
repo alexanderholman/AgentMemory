@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -66,6 +67,47 @@ class DoctorCheck:
     detail: str
 
 
+@dataclass
+class ActionDocument:
+    timestamp: str
+    memory_uuid: str
+    agent: str
+    session: str
+    event_type: str
+    title: str
+    summary: str
+    message: str
+    relative_path: str
+    source_bytes: int
+    source_text: str
+
+
+@dataclass
+class SearchResult:
+    timestamp: str
+    memory_uuid: str
+    agent: str
+    session: str
+    event_type: str
+    relative_path: str
+    matched_field: str
+    snippet: str
+    score: float
+
+    def as_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "memory_uuid": self.memory_uuid,
+            "agent": self.agent,
+            "session": self.session,
+            "event_type": self.event_type,
+            "relative_path": self.relative_path,
+            "matched_field": self.matched_field,
+            "snippet": self.snippet,
+            "score": self.score,
+        }
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -83,6 +125,51 @@ def safe_name(value: str) -> str:
     return re.sub(r"-+", "-", cleaned).strip("-") or "unknown"
 
 
+def validate_identifier(value: str, label: str) -> str:
+    if not value or value in {".", ".."}:
+        raise ValueError(f"{label} must not be empty, '.' or '..'")
+    if re.search(r"[\\/\x00-\x1f\x7f]", value):
+        raise ValueError(f"{label} contains a path separator or control character")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        raise ValueError(f"{label} contains unsupported characters")
+    return value
+
+
+def validate_display_name(value: str) -> str:
+    if not value or len(value) > 200 or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError("agent name must be a non-empty single-line value")
+    return value
+
+
+def validate_metadata_scalar(value: str, label: str) -> str:
+    if not value or len(value) > 500 or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError(f"{label} must be a bounded single-line value")
+    return value
+
+
+def parse_timestamp(value: str, label: str = "timestamp") -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid {label}: {value}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def single_line_text(value: str, max_chars: int = 280) -> str:
+    without_controls = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value)
+    collapsed = re.sub(r"\s+", " ", without_controls).strip()
+    if len(collapsed) > max_chars:
+        return collapsed[: max_chars - 3] + "..."
+    return collapsed or "(empty)"
+
+
+def escape_reserved_headings(value: str) -> str:
+    reserved = "Links|Summary|Full Message|Tool Outputs \\(summarized\\)|Raw Output Links"
+    return re.sub(rf"(?m)^## ({reserved})$", r"\\## \1", value)
+
+
 def wiki_link(path: Path, root: Path) -> str:
     rel = path.relative_to(root).as_posix()
     if rel.endswith(".md"):
@@ -94,7 +181,12 @@ def link_to_path(link: str, root: Path) -> Path:
     stripped = link.strip()
     if stripped.startswith("[[") and stripped.endswith("]]"):
         stripped = stripped[2:-2]
-    candidate = root / stripped
+    root_resolved = root.resolve()
+    candidate = (root_resolved / stripped).resolve(strict=False)
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"memory link escapes root: {link}") from exc
     if stripped.endswith(".md") or stripped.endswith(".raw"):
         return candidate
     md = Path(str(candidate) + ".md")
@@ -153,7 +245,7 @@ def write_text_locked(path: Path, content: str) -> None:
 
 
 def state_path(root: Path, session_id: str) -> Path:
-    return root / "memory" / ".state" / f"{safe_name(session_id)}.json"
+    return root / "memory" / ".state" / f"{validate_identifier(session_id, 'session id')}.json"
 
 
 def load_state(root: Path, session_id: str) -> dict:
@@ -178,13 +270,16 @@ def redact_text(content: str) -> tuple[str, bool]:
         if count > 0:
             touched = True
 
+    # Avoid destroying useful memory such as paths and long identifiers. Only
+    # mask long values that contain characters commonly present in secrets.
     entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{24,}\b")
-    matches = set(entropy_like.findall(redacted))
-    for token in matches:
-        if token.count("-") >= 4:
-            continue
-        redacted = redacted.replace(token, "[REDACTED_TOKEN]")
+
+    def redact_entropy_match(match: re.Match) -> str:
+        nonlocal touched
         touched = True
+        return "[REDACTED_TOKEN]"
+
+    redacted = entropy_like.sub(redact_entropy_match, redacted)
 
     return redacted, touched
 
@@ -195,6 +290,234 @@ def summarize(text: str, max_lines: int = 8, max_chars: int = 800) -> str:
     if len(clipped) > max_chars:
         clipped = clipped[: max_chars - 3] + "..."
     return clipped or "(empty)"
+
+
+def _generated_tool_boundary(text: str) -> int | None:
+    marker = "\n## Tool Outputs (summarized)\n"
+    offset = 0
+    while True:
+        boundary = text.find(marker, offset)
+        if boundary < 0:
+            return None
+        following = text[boundary + len(marker) :]
+        if (
+            (following.startswith("- none") or following.startswith("- tool:"))
+            and "\n## Raw Output Links\n" in following
+        ):
+            return boundary
+        offset = boundary + len(marker)
+
+
+def parse_memory_sections(body: str) -> tuple[str, str]:
+    links_marker = "\n## Links\n"
+    summary_marker = "\n## Summary\n"
+    full_message_marker = "\n## Full Message\n"
+    offset = 0
+    content = ""
+    while True:
+        links_boundary = body.find(links_marker, offset)
+        if links_boundary < 0:
+            return "", ""
+        following = body[links_boundary + len(links_marker) :]
+        if following.startswith("- master: [[memory/master]]") and summary_marker in following:
+            content = following.split(summary_marker, 1)[1]
+            break
+        offset = links_boundary + len(links_marker)
+    tool_boundary = _generated_tool_boundary(content)
+    if tool_boundary is None:
+        return "", ""
+    searchable = content[:tool_boundary]
+    boundaries = [match.start() for match in re.finditer(re.escape(full_message_marker), searchable)]
+    if not boundaries:
+        return searchable.strip(), ""
+    summary = searchable[: boundaries[0]].strip()
+    message = searchable[boundaries[-1] + len(full_message_marker) :].strip()
+    return summary, message
+
+
+def read_canonical_file(path: Path, root: Path, max_bytes: int) -> tuple[str, str, int]:
+    root_resolved = root.resolve()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("canonical action cannot be opened safely") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("canonical action must be a regular file")
+        if details.st_size > max_bytes:
+            raise ValueError("canonical action exceeds size limit")
+        descriptor_path = Path(f"/proc/self/fd/{descriptor}").resolve()
+        try:
+            relative_path = descriptor_path.relative_to(root_resolved).as_posix()
+        except ValueError as exc:
+            raise ValueError("canonical action escapes memory root") from exc
+        with os.fdopen(os.dup(descriptor), "r", encoding="utf-8") as handle:
+            return handle.read(max_bytes + 1), relative_path, details.st_size
+    finally:
+        os.close(descriptor)
+
+
+def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) -> ActionDocument:
+    text, relative_path, source_bytes = read_canonical_file(path, root, max_bytes)
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        raise ValueError("canonical action has invalid front matter")
+    front_matter, body = text[4:].split("\n---\n", 1)
+    metadata: dict[str, str] = {}
+    for line in front_matter.splitlines():
+        if ":" not in line:
+            raise ValueError("canonical action has malformed metadata")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if not key or key in metadata:
+            raise ValueError("canonical action has duplicate or empty metadata")
+        metadata[key] = value.strip()
+
+    required = ("timestamp", "memory_uuid", "agent_id", "session_id", "event_type")
+    if any(not metadata.get(field) for field in required):
+        raise ValueError("canonical action is missing required metadata")
+    parse_timestamp(metadata["timestamp"])
+    validate_identifier(metadata["memory_uuid"], "memory UUID")
+    validate_identifier(metadata["agent_id"], "agent id")
+    validate_identifier(metadata["session_id"], "session id")
+    validate_identifier(metadata["event_type"], "event type")
+
+    title = ""
+    for line in body.splitlines():
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+    summary, message = parse_memory_sections(body)
+    return ActionDocument(
+        timestamp=metadata["timestamp"],
+        memory_uuid=metadata["memory_uuid"],
+        agent=metadata["agent_id"],
+        session=metadata["session_id"],
+        event_type=metadata["event_type"],
+        title=title,
+        summary=summary,
+        message=message,
+        relative_path=relative_path,
+        source_bytes=source_bytes,
+        source_text=text,
+    )
+
+
+def _query_terms(query: str) -> list[str]:
+    if not query.strip():
+        raise ValueError("search query must not be empty")
+    if len(query) > 1000:
+        raise ValueError("search query exceeds size limit")
+    terms = list(dict.fromkeys(re.findall(r"\w+", query.casefold(), flags=re.UNICODE)))
+    if not terms:
+        raise ValueError("search query must contain searchable characters")
+    if len(terms) > 32:
+        raise ValueError("search query contains too many unique terms")
+    return terms
+
+
+def _matching_score(content: str, terms: list[str]) -> float:
+    folded = content.casefold()
+    counts = [len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", folded)) for term in terms]
+    if any(count == 0 for count in counts):
+        return 0.0
+    return float(sum(counts))
+
+
+def search_action_documents(
+    root: Path,
+    query: str,
+    *,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+) -> list[SearchResult]:
+    root = root.expanduser().resolve()
+    terms = _query_terms(query)
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    if agent_id:
+        agent_id = validate_identifier(agent_id, "agent id")
+    if session_id:
+        session_id = validate_identifier(session_id, "session id")
+    if event_type:
+        event_type = validate_identifier(event_type, "event type")
+    since_value = parse_timestamp(since, "since timestamp") if since else None
+    until_value = parse_timestamp(until, "until timestamp") if until else None
+    if since_value and until_value and since_value > until_value:
+        raise ValueError("since timestamp must not be after until timestamp")
+
+    action_root = root / "actions"
+    if not action_root.is_dir() or action_root.is_symlink():
+        return []
+
+    results: list[SearchResult] = []
+    field_order = {"title": 0, "summary": 1, "message": 2}
+    scanned_files = 0
+    scanned_bytes = 0
+    scanned_directories = 0
+    for current_dir, dirs, files in os.walk(action_root, followlinks=False):
+        scanned_directories += 1
+        if scanned_directories > 10_000:
+            raise ValueError("search scan exceeds configured resource limits")
+        dirs[:] = sorted(name for name in dirs if name != "raw")
+        for filename in sorted(files):
+            if not filename.endswith(".md"):
+                continue
+            path = Path(current_dir) / filename
+            scanned_files += 1
+            try:
+                scanned_bytes += min(path.lstat().st_size, 1_000_001)
+            except OSError:
+                pass
+            if scanned_files > 10_000 or scanned_bytes > 50_000_000:
+                raise ValueError("search scan exceeds configured resource limits")
+            try:
+                document = parse_action_document(path, root)
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if agent_id and document.agent != agent_id:
+                continue
+            if session_id and document.session != session_id:
+                continue
+            if event_type and document.event_type != event_type:
+                continue
+            document_timestamp = parse_timestamp(document.timestamp)
+            if since_value and document_timestamp < since_value:
+                continue
+            if until_value and document_timestamp > until_value:
+                continue
+
+            candidates = []
+            for field in ("title", "summary", "message"):
+                content, _ = redact_text(getattr(document, field))
+                score = _matching_score(content, terms)
+                if score:
+                    candidates.append((score, field_order[field], field, single_line_text(content)))
+            if not candidates:
+                continue
+            score, _, matched_field, snippet = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
+            results.append(
+                SearchResult(
+                    timestamp=document.timestamp,
+                    memory_uuid=document.memory_uuid,
+                    agent=document.agent,
+                    session=document.session,
+                    event_type=document.event_type,
+                    relative_path=document.relative_path,
+                    matched_field=matched_field,
+                    snippet=snippet,
+                    score=score,
+                )
+            )
+
+    results.sort(key=lambda item: (parse_timestamp(item.timestamp), item.memory_uuid), reverse=True)
+    results.sort(key=lambda item: (-item.score, field_order[item.matched_field]))
+    return results[:limit]
 
 
 def parse_message(args: argparse.Namespace) -> str:
@@ -274,13 +597,13 @@ def command_log(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     ensure_layout(root)
 
-    agent_id = safe_name(args.agent_id)
-    agent_name = safe_name(args.agent_name or agent_id)
-    session_id = safe_name(args.session_id)
-    event_type = safe_name(args.event_type)
-    model = args.model or "unknown"
-    provider = args.provider or "unknown"
-    variant = args.variant or "unknown"
+    agent_id = validate_identifier(args.agent_id, "agent id")
+    agent_name = validate_display_name(args.agent_name or agent_id)
+    session_id = validate_identifier(args.session_id, "session id")
+    event_type = validate_identifier(args.event_type, "event type")
+    model = validate_metadata_scalar(args.model or "unknown", "model")
+    provider = validate_metadata_scalar(args.provider or "unknown", "provider")
+    variant = validate_metadata_scalar(args.variant or "unknown", "variant")
 
     message = parse_message(args)
     tool_output = parse_tool_output(args)
@@ -288,6 +611,8 @@ def command_log(args: argparse.Namespace) -> int:
 
     message_redacted, message_masked = redact_text(message)
     tool_redacted, tool_masked = redact_text(tool_output)
+    message_redacted = escape_reserved_headings(message_redacted)
+    tool_document_text = escape_reserved_headings(tool_redacted)
     any_redacted = message_masked or tool_masked
 
     state = load_state(root, session_id)
@@ -303,7 +628,7 @@ def command_log(args: argparse.Namespace) -> int:
     ts_compact = compact_ts(now)
     year = now.strftime("%Y")
     month = now.strftime("%m")
-    memory_uuid = args.memory_uuid or str(uuid.uuid4())
+    memory_uuid = validate_identifier(args.memory_uuid or str(uuid.uuid4()), "memory UUID")
 
     action_dir = root / "actions" / year / month
     raw_dir = action_dir / "raw"
@@ -314,7 +639,7 @@ def command_log(args: argparse.Namespace) -> int:
     raw_link = ""
     raw_summary = ""
     if tool_redacted:
-        raw_summary = summarize(tool_redacted)
+        raw_summary = summarize(tool_document_text)
         should_write_raw = args.raw_mode == "always" or len(tool_redacted) > args.raw_threshold
         if should_write_raw:
             raw_file = raw_dir / f"{ts_compact}-{memory_uuid}.raw"
@@ -324,7 +649,7 @@ def command_log(args: argparse.Namespace) -> int:
             raw_link = wiki_link(raw_file, root)
 
     master_file = root / "memory" / "master.md"
-    agent_file = root / "memory" / "agents" / f"{agent_name}.md"
+    agent_file = root / "memory" / "agents" / f"{agent_id}.md"
     session_file = root / "memory" / "sessions" / f"{session_id}.md"
 
     if not agent_file.exists():
@@ -340,8 +665,13 @@ def command_log(args: argparse.Namespace) -> int:
     if state.get("last_event"):
         previous_link = wiki_link(root / state["last_event"], root)
 
-    title = args.title or f"{event_type} from {agent_name}"
-    summary_text = args.summary or summarize(message_redacted, max_lines=3, max_chars=280)
+    title, title_masked = redact_text(args.title or f"{event_type} from {agent_name}")
+    title = single_line_text(title, max_chars=200)
+    summary_text, summary_masked = redact_text(
+        args.summary or summarize(message_redacted, max_lines=3, max_chars=280)
+    )
+    summary_text = escape_reserved_headings(summary_text)
+    any_redacted = any_redacted or title_masked or summary_masked
 
     tool_lines = "- none"
     if tool_redacted:
@@ -404,6 +734,20 @@ def command_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def canonical_action_preview(entry: IndexEntry, root: Path, max_chars: int) -> tuple[Path | None, str | None, str | None]:
+    try:
+        action_path = link_to_path(entry.action_link, root)
+    except ValueError as exc:
+        return None, None, f"unsafe action link: {exc}"
+    if action_path.suffix != ".md":
+        return action_path, None, "unsafe action link: action link does not reference canonical Markdown"
+    try:
+        document = parse_action_document(action_path, root)
+        return action_path, summarize(document.source_text, max_lines=12, max_chars=max_chars), None
+    except (OSError, UnicodeError, ValueError) as exc:
+        return action_path, None, f"unsafe action link: {exc}"
+
+
 def command_load(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     ensure_layout(root)
@@ -414,20 +758,33 @@ def command_load(args: argparse.Namespace) -> int:
     elif source == "agent":
         if not args.agent_id:
             raise SystemExit("--agent-id is required when --source agent")
-        path = root / "memory" / "agents" / f"{safe_name(args.agent_id)}.md"
+        requested_agent = validate_identifier(args.agent_id, "agent id")
+        path = root / "memory" / "agents" / f"{requested_agent}.md"
     else:
         if not args.session_id:
             raise SystemExit("--session-id is required when --source session")
-        path = root / "memory" / "sessions" / f"{safe_name(args.session_id)}.md"
+        path = root / "memory" / "sessions" / f"{validate_identifier(args.session_id, 'session id')}.md"
 
     entries = load_index_entries(path)
+    if source == "agent":
+        canonical_entries = entries
+        master_entries = load_index_entries(root / "memory" / "master.md")
+        entries = []
+        seen_memory_uuids: set[str] = set()
+        for entry in canonical_entries + master_entries:
+            if entry.agent != requested_agent:
+                continue
+            if entry.memory_uuid in seen_memory_uuids:
+                continue
+            entries.append(entry)
+            seen_memory_uuids.add(entry.memory_uuid)
 
     if args.agent_id:
-        entries = [entry for entry in entries if entry.agent == safe_name(args.agent_id)]
+        entries = [entry for entry in entries if entry.agent == validate_identifier(args.agent_id, "agent id")]
     if args.session_id:
-        entries = [entry for entry in entries if entry.session == safe_name(args.session_id)]
+        entries = [entry for entry in entries if entry.session == validate_identifier(args.session_id, "session id")]
     if args.event_type:
-        entries = [entry for entry in entries if entry.event_type == safe_name(args.event_type)]
+        entries = [entry for entry in entries if entry.event_type == validate_identifier(args.event_type, "event type")]
 
     if args.since:
         entries = [entry for entry in entries if entry.timestamp >= args.since]
@@ -451,28 +808,66 @@ def command_load(args: argparse.Namespace) -> int:
                 "summary": entry.summary,
             }
             if args.with_action:
-                action_path = link_to_path(entry.action_link, root)
-                row["action_path"] = action_path.as_posix()
-                if action_path.exists():
-                    row["action_preview"] = summarize(action_path.read_text(encoding="utf-8"), max_lines=12, max_chars=1600)
+                action_path, preview, error = canonical_action_preview(entry, root, 1600)
+                if action_path:
+                    row["action_path"] = action_path.as_posix()
+                if preview:
+                    row["action_preview"] = preview
+                if error:
+                    row["action_error"] = error
             payload.append(row)
         print(json.dumps(payload, indent=2))
         return 0
 
     for entry in entries:
+        safe_values = [
+            single_line_text(value, max_chars=500)
+            for value in (
+                entry.timestamp,
+                entry.memory_uuid,
+                entry.agent,
+                entry.session,
+                entry.event_type,
+                entry.action_link,
+                entry.summary,
+            )
+        ]
         print(
-            f"{entry.timestamp} | {entry.memory_uuid} | {entry.agent} | "
-            f"{entry.session} | {entry.event_type} | {entry.action_link} | {entry.summary}"
+            f"{safe_values[0]} | {safe_values[1]} | {safe_values[2]} | "
+            f"{safe_values[3]} | {safe_values[4]} | {safe_values[5]} | {safe_values[6]}"
         )
         if args.with_action:
-            action_path = link_to_path(entry.action_link, root)
-            if action_path.exists():
-                preview = summarize(action_path.read_text(encoding='utf-8'), max_lines=12, max_chars=1200)
-                print(f"  action: {action_path}")
-                print(f"  preview: {preview}")
+            action_path, preview, error = canonical_action_preview(entry, root, 1200)
+            if action_path and preview:
+                print(f"  action: {single_line_text(action_path.as_posix(), max_chars=500)}")
+                print(f"  preview: {single_line_text(preview, max_chars=1200)}")
             else:
-                print(f"  action: missing ({action_path})")
+                print(f"  action: rejected ({single_line_text(error or 'unknown error', max_chars=500)})")
 
+    return 0
+
+
+def command_search(args: argparse.Namespace) -> int:
+    results = search_action_documents(
+        Path(args.root),
+        args.query,
+        agent_id=args.agent_id,
+        session_id=args.session_id,
+        event_type=args.event_type,
+        since=args.since,
+        until=args.until,
+        limit=args.limit,
+    )
+    if args.format == "json":
+        print(json.dumps([result.as_dict() for result in results], indent=2))
+        return 0
+    for result in results:
+        safe_path = single_line_text(result.relative_path, max_chars=500)
+        print(
+            f"{result.score:.1f} | {result.timestamp} | {result.memory_uuid} | "
+            f"{result.agent} | {result.session} | {result.event_type} | "
+            f"{safe_path} | {result.matched_field} | {result.snippet}"
+        )
     return 0
 
 
@@ -491,7 +886,17 @@ def command_validate(args: argparse.Namespace) -> int:
     for index_path in index_paths:
         entries = load_index_entries(index_path)
         for entry in entries:
-            action_path = link_to_path(entry.action_link, root)
+            try:
+                action_path = link_to_path(entry.action_link, root)
+            except ValueError as exc:
+                issues.append(
+                    ValidationIssue(
+                        kind="unsafe_memory_link",
+                        path=index_path.as_posix(),
+                        detail=str(exc),
+                    )
+                )
+                continue
             referenced_actions.add(action_path)
             if not action_path.exists():
                 issues.append(
@@ -506,9 +911,19 @@ def command_validate(args: argparse.Namespace) -> int:
     for action_file in action_files:
         text = action_file.read_text(encoding="utf-8")
         for raw_link in extract_wiki_links(text):
+            try:
+                linked = link_to_path(f"[[{raw_link}]]", root)
+            except ValueError as exc:
+                issues.append(
+                    ValidationIssue(
+                        kind="unsafe_memory_link",
+                        path=action_file.as_posix(),
+                        detail=str(exc),
+                    )
+                )
+                continue
             if not raw_link.startswith("actions/"):
                 continue
-            linked = link_to_path(f"[[{raw_link}]]", root)
             if linked.suffix == ".raw":
                 referenced_raw.add(linked)
                 if not linked.exists():
@@ -699,6 +1114,18 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser.add_argument("--with-action", action="store_true", help="include action preview")
     load_parser.add_argument("--format", choices=["text", "json"], default="text")
     load_parser.set_defaults(func=command_load)
+
+    search_parser = subparsers.add_parser("search", help="search canonical action memories")
+    search_parser.add_argument("query", help="terms that must occur in one canonical field")
+    search_parser.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")
+    search_parser.add_argument("--agent-id")
+    search_parser.add_argument("--session-id")
+    search_parser.add_argument("--event-type")
+    search_parser.add_argument("--since", help="ISO timestamp lower bound")
+    search_parser.add_argument("--until", help="ISO timestamp upper bound")
+    search_parser.add_argument("--limit", type=int, default=50)
+    search_parser.add_argument("--format", choices=["text", "json"], default="text")
+    search_parser.set_defaults(func=command_search)
 
     validate_parser = subparsers.add_parser("validate", help="validate links and raw artifacts")
     validate_parser.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")

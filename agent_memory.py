@@ -141,6 +141,12 @@ def validate_display_name(value: str) -> str:
     return value
 
 
+def validate_metadata_scalar(value: str, label: str) -> str:
+    if not value or len(value) > 500 or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError(f"{label} must be a bounded single-line value")
+    return value
+
+
 def parse_timestamp(value: str, label: str = "timestamp") -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -595,9 +601,9 @@ def command_log(args: argparse.Namespace) -> int:
     agent_name = validate_display_name(args.agent_name or agent_id)
     session_id = validate_identifier(args.session_id, "session id")
     event_type = validate_identifier(args.event_type, "event type")
-    model = args.model or "unknown"
-    provider = args.provider or "unknown"
-    variant = args.variant or "unknown"
+    model = validate_metadata_scalar(args.model or "unknown", "model")
+    provider = validate_metadata_scalar(args.provider or "unknown", "provider")
+    variant = validate_metadata_scalar(args.variant or "unknown", "variant")
 
     message = parse_message(args)
     tool_output = parse_tool_output(args)

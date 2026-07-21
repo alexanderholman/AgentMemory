@@ -66,6 +66,45 @@ class DoctorCheck:
     detail: str
 
 
+@dataclass
+class ActionDocument:
+    timestamp: str
+    memory_uuid: str
+    agent: str
+    session: str
+    event_type: str
+    title: str
+    summary: str
+    message: str
+    relative_path: str
+
+
+@dataclass
+class SearchResult:
+    timestamp: str
+    memory_uuid: str
+    agent: str
+    session: str
+    event_type: str
+    relative_path: str
+    matched_field: str
+    snippet: str
+    score: float
+
+    def as_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "memory_uuid": self.memory_uuid,
+            "agent": self.agent,
+            "session": self.session,
+            "event_type": self.event_type,
+            "relative_path": self.relative_path,
+            "matched_field": self.matched_field,
+            "snippet": self.snippet,
+            "score": self.score,
+        }
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -83,6 +122,16 @@ def safe_name(value: str) -> str:
     return re.sub(r"-+", "-", cleaned).strip("-") or "unknown"
 
 
+def validate_identifier(value: str, label: str) -> str:
+    if not value or value in {".", ".."}:
+        raise ValueError(f"{label} must not be empty, '.' or '..'")
+    if re.search(r"[\\/\x00-\x1f\x7f]", value):
+        raise ValueError(f"{label} contains a path separator or control character")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        raise ValueError(f"{label} contains unsupported characters")
+    return value
+
+
 def wiki_link(path: Path, root: Path) -> str:
     rel = path.relative_to(root).as_posix()
     if rel.endswith(".md"):
@@ -94,7 +143,12 @@ def link_to_path(link: str, root: Path) -> Path:
     stripped = link.strip()
     if stripped.startswith("[[") and stripped.endswith("]]"):
         stripped = stripped[2:-2]
-    candidate = root / stripped
+    root_resolved = root.resolve()
+    candidate = (root_resolved / stripped).resolve(strict=False)
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"memory link escapes root: {link}") from exc
     if stripped.endswith(".md") or stripped.endswith(".raw"):
         return candidate
     md = Path(str(candidate) + ".md")
@@ -153,7 +207,7 @@ def write_text_locked(path: Path, content: str) -> None:
 
 
 def state_path(root: Path, session_id: str) -> Path:
-    return root / "memory" / ".state" / f"{safe_name(session_id)}.json"
+    return root / "memory" / ".state" / f"{validate_identifier(session_id, 'session id')}.json"
 
 
 def load_state(root: Path, session_id: str) -> dict:
@@ -195,6 +249,161 @@ def summarize(text: str, max_lines: int = 8, max_chars: int = 800) -> str:
     if len(clipped) > max_chars:
         clipped = clipped[: max_chars - 3] + "..."
     return clipped or "(empty)"
+
+
+def _section(text: str, heading: str) -> str:
+    marker = f"## {heading}\n"
+    if marker not in text:
+        return ""
+    content = text.split(marker, 1)[1]
+    return content.split("\n## ", 1)[0].strip()
+
+
+def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) -> ActionDocument:
+    root_resolved = root.resolve()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("canonical action must be a regular, non-symlink file")
+    resolved = path.resolve()
+    try:
+        relative_path = resolved.relative_to(root_resolved).as_posix()
+    except ValueError as exc:
+        raise ValueError("canonical action escapes memory root") from exc
+    if path.stat().st_size > max_bytes:
+        raise ValueError("canonical action exceeds size limit")
+
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        raise ValueError("canonical action has invalid front matter")
+    front_matter, body = text[4:].split("\n---\n", 1)
+    metadata: dict[str, str] = {}
+    for line in front_matter.splitlines():
+        if ":" not in line:
+            raise ValueError("canonical action has malformed metadata")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if not key or key in metadata:
+            raise ValueError("canonical action has duplicate or empty metadata")
+        metadata[key] = value.strip()
+
+    required = ("timestamp", "memory_uuid", "agent_id", "session_id", "event_type")
+    if any(not metadata.get(field) for field in required):
+        raise ValueError("canonical action is missing required metadata")
+    validate_identifier(metadata["agent_id"], "agent id")
+    validate_identifier(metadata["session_id"], "session id")
+    validate_identifier(metadata["event_type"], "event type")
+
+    title = ""
+    for line in body.splitlines():
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+    return ActionDocument(
+        timestamp=metadata["timestamp"],
+        memory_uuid=metadata["memory_uuid"],
+        agent=metadata["agent_id"],
+        session=metadata["session_id"],
+        event_type=metadata["event_type"],
+        title=title,
+        summary=_section(body, "Summary"),
+        message=_section(body, "Full Message"),
+        relative_path=relative_path,
+    )
+
+
+def _query_terms(query: str) -> list[str]:
+    if not query.strip():
+        raise ValueError("search query must not be empty")
+    if len(query) > 1000:
+        raise ValueError("search query exceeds size limit")
+    terms = re.findall(r"\w+", query.casefold(), flags=re.UNICODE)
+    if not terms:
+        raise ValueError("search query must contain searchable characters")
+    return terms
+
+
+def _matching_score(content: str, terms: list[str]) -> float:
+    folded = content.casefold()
+    counts = [len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", folded)) for term in terms]
+    if any(count == 0 for count in counts):
+        return 0.0
+    return float(sum(counts))
+
+
+def search_action_documents(
+    root: Path,
+    query: str,
+    *,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+) -> list[SearchResult]:
+    root = root.expanduser().resolve()
+    terms = _query_terms(query)
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    if agent_id:
+        validate_identifier(agent_id, "agent id")
+    if session_id:
+        validate_identifier(session_id, "session id")
+    if event_type:
+        validate_identifier(event_type, "event type")
+
+    action_root = root / "actions"
+    if not action_root.is_dir() or action_root.is_symlink():
+        return []
+
+    results: list[SearchResult] = []
+    field_order = {"title": 0, "summary": 1, "message": 2}
+    for current_dir, dirs, files in os.walk(action_root, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if name != "raw")
+        for filename in sorted(files):
+            if not filename.endswith(".md"):
+                continue
+            path = Path(current_dir) / filename
+            try:
+                document = parse_action_document(path, root)
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if agent_id and document.agent != agent_id:
+                continue
+            if session_id and document.session != session_id:
+                continue
+            if event_type and document.event_type != event_type:
+                continue
+            if since and document.timestamp < since:
+                continue
+            if until and document.timestamp > until:
+                continue
+
+            candidates = []
+            for field in ("title", "summary", "message"):
+                content = getattr(document, field)
+                score = _matching_score(content, terms)
+                if score:
+                    candidates.append((score, field_order[field], field, summarize(content, max_lines=3, max_chars=280)))
+            if not candidates:
+                continue
+            score, _, matched_field, snippet = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
+            results.append(
+                SearchResult(
+                    timestamp=document.timestamp,
+                    memory_uuid=document.memory_uuid,
+                    agent=document.agent,
+                    session=document.session,
+                    event_type=document.event_type,
+                    relative_path=document.relative_path,
+                    matched_field=matched_field,
+                    snippet=snippet,
+                    score=score,
+                )
+            )
+
+    results.sort(key=lambda item: (item.timestamp, item.memory_uuid), reverse=True)
+    results.sort(key=lambda item: (-item.score, field_order[item.matched_field]))
+    return results[:limit]
 
 
 def parse_message(args: argparse.Namespace) -> str:
@@ -274,10 +483,10 @@ def command_log(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     ensure_layout(root)
 
-    agent_id = safe_name(args.agent_id)
-    agent_name = safe_name(args.agent_name or agent_id)
-    session_id = safe_name(args.session_id)
-    event_type = safe_name(args.event_type)
+    agent_id = validate_identifier(args.agent_id, "agent id")
+    agent_name = validate_identifier(args.agent_name or agent_id, "agent name")
+    session_id = validate_identifier(args.session_id, "session id")
+    event_type = validate_identifier(args.event_type, "event type")
     model = args.model or "unknown"
     provider = args.provider or "unknown"
     variant = args.variant or "unknown"
@@ -303,7 +512,7 @@ def command_log(args: argparse.Namespace) -> int:
     ts_compact = compact_ts(now)
     year = now.strftime("%Y")
     month = now.strftime("%m")
-    memory_uuid = args.memory_uuid or str(uuid.uuid4())
+    memory_uuid = validate_identifier(args.memory_uuid or str(uuid.uuid4()), "memory UUID")
 
     action_dir = root / "actions" / year / month
     raw_dir = action_dir / "raw"
@@ -324,7 +533,7 @@ def command_log(args: argparse.Namespace) -> int:
             raw_link = wiki_link(raw_file, root)
 
     master_file = root / "memory" / "master.md"
-    agent_file = root / "memory" / "agents" / f"{agent_name}.md"
+    agent_file = root / "memory" / "agents" / f"{agent_id}.md"
     session_file = root / "memory" / "sessions" / f"{session_id}.md"
 
     if not agent_file.exists():
@@ -414,20 +623,32 @@ def command_load(args: argparse.Namespace) -> int:
     elif source == "agent":
         if not args.agent_id:
             raise SystemExit("--agent-id is required when --source agent")
-        path = root / "memory" / "agents" / f"{safe_name(args.agent_id)}.md"
+        path = root / "memory" / "agents" / f"{validate_identifier(args.agent_id, 'agent id')}.md"
     else:
         if not args.session_id:
             raise SystemExit("--session-id is required when --source session")
-        path = root / "memory" / "sessions" / f"{safe_name(args.session_id)}.md"
+        path = root / "memory" / "sessions" / f"{validate_identifier(args.session_id, 'session id')}.md"
 
-    entries = load_index_entries(path)
+    if source == "agent":
+        entries = []
+        seen_memory_uuids: set[str] = set()
+        agent_dir = root / "memory" / "agents"
+        for item in sorted(os.scandir(agent_dir), key=lambda candidate: candidate.name):
+            if not item.name.endswith(".md") or not item.is_file(follow_symlinks=False):
+                continue
+            for entry in load_index_entries(Path(item.path)):
+                if entry.memory_uuid not in seen_memory_uuids:
+                    entries.append(entry)
+                    seen_memory_uuids.add(entry.memory_uuid)
+    else:
+        entries = load_index_entries(path)
 
     if args.agent_id:
-        entries = [entry for entry in entries if entry.agent == safe_name(args.agent_id)]
+        entries = [entry for entry in entries if entry.agent == validate_identifier(args.agent_id, "agent id")]
     if args.session_id:
-        entries = [entry for entry in entries if entry.session == safe_name(args.session_id)]
+        entries = [entry for entry in entries if entry.session == validate_identifier(args.session_id, "session id")]
     if args.event_type:
-        entries = [entry for entry in entries if entry.event_type == safe_name(args.event_type)]
+        entries = [entry for entry in entries if entry.event_type == validate_identifier(args.event_type, "event type")]
 
     if args.since:
         entries = [entry for entry in entries if entry.timestamp >= args.since]
@@ -473,6 +694,29 @@ def command_load(args: argparse.Namespace) -> int:
             else:
                 print(f"  action: missing ({action_path})")
 
+    return 0
+
+
+def command_search(args: argparse.Namespace) -> int:
+    results = search_action_documents(
+        Path(args.root),
+        args.query,
+        agent_id=args.agent_id,
+        session_id=args.session_id,
+        event_type=args.event_type,
+        since=args.since,
+        until=args.until,
+        limit=args.limit,
+    )
+    if args.format == "json":
+        print(json.dumps([result.as_dict() for result in results], indent=2))
+        return 0
+    for result in results:
+        print(
+            f"{result.score:.1f} | {result.timestamp} | {result.memory_uuid} | "
+            f"{result.agent} | {result.session} | {result.event_type} | "
+            f"{result.relative_path} | {result.matched_field} | {result.snippet}"
+        )
     return 0
 
 
@@ -699,6 +943,18 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser.add_argument("--with-action", action="store_true", help="include action preview")
     load_parser.add_argument("--format", choices=["text", "json"], default="text")
     load_parser.set_defaults(func=command_load)
+
+    search_parser = subparsers.add_parser("search", help="search canonical action memories")
+    search_parser.add_argument("query", help="terms that must occur in one canonical field")
+    search_parser.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")
+    search_parser.add_argument("--agent-id")
+    search_parser.add_argument("--session-id")
+    search_parser.add_argument("--event-type")
+    search_parser.add_argument("--since", help="ISO timestamp lower bound")
+    search_parser.add_argument("--until", help="ISO timestamp upper bound")
+    search_parser.add_argument("--limit", type=int, default=50)
+    search_parser.add_argument("--format", choices=["text", "json"], default="text")
+    search_parser.set_defaults(func=command_search)
 
     validate_parser = subparsers.add_parser("validate", help="validate links and raw artifacts")
     validate_parser.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")

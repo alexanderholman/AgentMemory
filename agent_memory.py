@@ -178,10 +178,21 @@ def redact_text(content: str) -> tuple[str, bool]:
         if count > 0:
             touched = True
 
-    entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{24,}\b")
+    # Heuristic redaction: keep it conservative to avoid destroying useful
+    # repo memory (e.g., file paths and long identifier names).
+    #
+    # Only redact "token-like" strings that are long AND contain characters
+    # typical of secrets (digits and/or base64-ish symbols). Pure alpha words
+    # and path-like segments should not be redacted.
+    entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{32,}\b")
     matches = set(entropy_like.findall(redacted))
     for token in matches:
         if token.count("-") >= 4:
+            continue
+        # Avoid redacting long identifiers and path-like segments.
+        if re.fullmatch(r"[A-Za-z/]+", token):
+            continue
+        if not re.search(r"[0-9+=_]", token):
             continue
         redacted = redacted.replace(token, "[REDACTED_TOKEN]")
         touched = True

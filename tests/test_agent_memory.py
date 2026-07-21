@@ -1,11 +1,18 @@
+import hashlib
 import json
 import os
 import sqlite3
+import struct
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import agent_memory
+
+
+OPERATOR_SCOPE = agent_memory.AcceptanceScope.OPERATOR_EVALUATION
+LOCAL_CACHE = agent_memory.EmbeddingCachePolicy.LOCAL_PRIVATE
 
 
 def write_action(
@@ -187,6 +194,228 @@ def test_search_cli_outputs_json(tmp_path: Path, capsys: pytest.CaptureFixture[s
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["memory_uuid"] == "cli-id"
     assert payload[0]["matched_field"] == "message"
+
+
+def test_search_parser_separates_text_backend_from_retrieval_mode() -> None:
+    parser = agent_memory.build_parser()
+
+    default_args = parser.parse_args(["search", "memory"])
+    semantic_args = parser.parse_args(
+        [
+            "search",
+            "memory",
+            "--mode",
+            "scan",
+            "--retrieval",
+            "semantic",
+            "--ollama-endpoint",
+            "http://127.0.0.1:11434",
+            "--ollama-model",
+            "model",
+            "--embedding-cache",
+            "local-private",
+        ]
+    )
+
+    assert (default_args.mode, default_args.retrieval) == ("auto", "text")
+    assert semantic_args.mode == "scan"
+    assert semantic_args.retrieval == "semantic"
+    assert semantic_args.embedding_cache == "local-private"
+
+
+def _cli_search_result(memory_uuid: str, score: float = 1.0) -> agent_memory.SearchResult:
+    return agent_memory.SearchResult(
+        timestamp="2026-07-21T12:00:00Z",
+        memory_uuid=memory_uuid,
+        agent="agent",
+        session="session",
+        event_type="message",
+        relative_path=f"actions/{memory_uuid}.md",
+        matched_field="semantic",
+        snippet=memory_uuid,
+        score=score,
+    )
+
+
+def _cli_fingerprint() -> agent_memory.ProviderFingerprint:
+    return agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="1.0",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+
+
+def _semantic_cli_args(parser, tmp_path: Path, retrieval: str = "semantic", format: str = "json"):
+    return parser.parse_args(
+        [
+            "search",
+            "memory",
+            "--root",
+            str(tmp_path),
+            "--retrieval",
+            retrieval,
+            "--ollama-endpoint",
+            "http://127.0.0.1:11434",
+            "--ollama-model",
+            "model",
+            "--embedding-cache",
+            "local-private",
+            "--format",
+            format,
+        ]
+    )
+
+
+def test_semantic_cli_requires_all_explicit_provider_and_cache_options(tmp_path: Path) -> None:
+    args = agent_memory.build_parser().parse_args(
+        ["search", "memory", "--root", str(tmp_path), "--retrieval", "semantic"]
+    )
+
+    with pytest.raises(ValueError, match="^semantic_configuration_required$"):
+        args.func(args)
+
+
+def test_semantic_cli_syncs_and_returns_typed_json_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fingerprint = _cli_fingerprint()
+    calls = []
+    monkeypatch.setattr(agent_memory, "discover_ollama_fingerprint", lambda config, **kwargs: fingerprint)
+    monkeypatch.setattr(
+        agent_memory,
+        "sync_memory_embeddings",
+        lambda root, identity, embed, **kwargs: calls.append((root, identity, kwargs)),
+    )
+    monkeypatch.setattr(
+        agent_memory,
+        "search_semantic_documents",
+        lambda root, query, identity, embed, **kwargs: [_cli_search_result("semantic-id")],
+    )
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path)
+
+    assert args.func(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "requested_mode": "semantic",
+        "effective_mode": "semantic",
+        "degraded": False,
+        "reason_code": None,
+        "provider_fingerprint": fingerprint.digest(),
+        "results": [_cli_search_result("semantic-id").as_dict()],
+    }
+    assert calls[0][1] == fingerprint
+    assert calls[0][2] == {"acceptance_scope": OPERATOR_SCOPE, "cache_policy": LOCAL_CACHE}
+
+
+def test_hybrid_cli_fuses_deep_lexical_and_semantic_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fingerprint = _cli_fingerprint()
+    limits = []
+    monkeypatch.setattr(agent_memory, "discover_ollama_fingerprint", lambda config, **kwargs: fingerprint)
+    monkeypatch.setattr(agent_memory, "sync_memory_embeddings", lambda *args, **kwargs: None)
+
+    def semantic(*args, **kwargs):
+        limits.append(kwargs["limit"])
+        return [
+            *[_cli_search_result(f"semantic-{index}") for index in range(50)],
+            _cli_search_result("shared"),
+        ]
+
+    def lexical(*args, **kwargs):
+        limits.append(kwargs["limit"])
+        return [
+            *[_cli_search_result(f"text-{index}") for index in range(50)],
+            _cli_search_result("shared"),
+        ]
+
+    monkeypatch.setattr(agent_memory, "search_semantic_documents", semantic)
+    monkeypatch.setattr(agent_memory, "search_memories", lexical)
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval="hybrid")
+    args.limit = 1
+
+    assert args.func(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effective_mode"] == "hybrid"
+    assert payload["results"][0]["memory_uuid"] == "shared"
+    assert payload["results"][0]["matched_field"] == "hybrid"
+    assert limits == [62, 62]
+
+
+def test_hybrid_cli_rejects_limit_beyond_safe_two_ranking_bound(tmp_path: Path) -> None:
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval="hybrid")
+    args.limit = 471
+
+    with pytest.raises(ValueError, match="^hybrid_limit_exceeds_safe_bound$"):
+        args.func(args)
+
+
+def test_hybrid_fallback_does_not_mask_programming_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        agent_memory,
+        "discover_ollama_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TypeError("programming defect")),
+    )
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval="hybrid")
+    args.allow_hybrid_text_fallback = True
+
+    with pytest.raises(TypeError, match="programming defect"):
+        args.func(args)
+
+
+@pytest.mark.parametrize("retrieval", ["semantic", "hybrid"])
+def test_model_retrieval_fails_closed_with_sanitized_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retrieval: str,
+) -> None:
+    monkeypatch.setattr(
+        agent_memory,
+        "discover_ollama_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("secret provider payload")),
+    )
+    monkeypatch.setattr(
+        agent_memory,
+        "search_memories",
+        lambda *args, **kwargs: pytest.fail("must not silently return text results"),
+    )
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval=retrieval)
+
+    with pytest.raises(ValueError, match="^semantic_provider_failure$"):
+        args.func(args)
+    assert capsys.readouterr().out == ""
+
+
+def test_hybrid_explicit_fallback_returns_visible_degradation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        agent_memory,
+        "discover_ollama_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("private failure detail")),
+    )
+    monkeypatch.setattr(
+        agent_memory,
+        "search_memories",
+        lambda *args, **kwargs: [_cli_search_result("text-id")],
+    )
+    parser = agent_memory.build_parser()
+    args = _semantic_cli_args(parser, tmp_path, retrieval="hybrid", format="text")
+    args.allow_hybrid_text_fallback = True
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "WARNING: retrieval degraded to text (semantic_provider_failure)" in output
+    assert "text-id" in output
 
 
 def test_log_rejects_traversal_identifier(tmp_path: Path) -> None:
@@ -1121,3 +1350,641 @@ def test_sync_rejects_root_replacement_during_discovery(
     monkeypatch.setattr(agent_memory, "_discover_index_documents", replace_after_discovery)
     with pytest.raises(ValueError, match="project root changed"):
         agent_memory.sync_memory_index(root)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("http://127.0.0.1:11434", "http://127.0.0.1:11434"),
+        ("http://[::1]:11434/", "http://[::1]:11434"),
+    ],
+)
+def test_ollama_endpoint_accepts_canonical_loopback_literals(
+    endpoint: str, expected: str
+) -> None:
+    assert agent_memory.validate_ollama_endpoint(endpoint) == expected
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://127.0.0.1:11434",
+        "http://localhost:11434",
+        "http://192.168.1.2:11434",
+        "http://127.0.0.1",
+        "http://user@127.0.0.1:11434",
+        "http://127.0.0.1:11434/api",
+        "http://127.0.0.1:11434?query=yes",
+        "http://127.0.0.1:11434#fragment",
+        "http://2130706433:11434",
+    ],
+)
+def test_ollama_endpoint_rejects_unsafe_or_ambiguous_urls(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        agent_memory.validate_ollama_endpoint(endpoint)
+
+
+def test_provider_fingerprint_is_stable_and_identity_complete() -> None:
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="nomic-embed-text:v1.5",
+        model_digest="sha256:abc123",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+
+    assert identity.digest() == replace(identity).digest()
+    for field, changed in (
+        ("provider", "other"),
+        ("endpoint", "http://127.0.0.1:11435"),
+        ("model", "other-model"),
+        ("model_digest", "sha256:def456"),
+        ("server_version", "0.11.5"),
+        ("document_prefix", "doc: "),
+        ("query_prefix", "query: "),
+        ("chunker_version", "canonical-fields-v2"),
+    ):
+        assert replace(identity, **{field: changed}).digest() != identity.digest()
+
+
+@pytest.mark.parametrize("field", ["model_digest", "server_version"])
+def test_provider_fingerprint_rejects_missing_reported_identity(field: str) -> None:
+    values = {
+        "provider": "ollama",
+        "endpoint": "http://127.0.0.1:11434",
+        "model": "nomic-embed-text:v1.5",
+        "model_digest": "sha256:abc123",
+        "server_version": "0.11.4",
+        "document_prefix": "search_document: ",
+        "query_prefix": "search_query: ",
+        "chunker_version": "canonical-fields-v1",
+    }
+    values[field] = ""
+    with pytest.raises(ValueError, match=field.replace("_", " ")):
+        agent_memory.ProviderFingerprint(**values)
+
+
+def test_ollama_config_requires_explicit_loopback_endpoint_and_model() -> None:
+    config = agent_memory.OllamaConfig(
+        endpoint="http://127.0.0.1:11434/",
+        model="nomic-embed-text:v1.5",
+    )
+    assert config.endpoint == "http://127.0.0.1:11434"
+    assert config.model == "nomic-embed-text:v1.5"
+
+    with pytest.raises(ValueError, match="model"):
+        agent_memory.OllamaConfig(endpoint="http://127.0.0.1:11434", model="")
+    with pytest.raises(ValueError, match="loopback"):
+        agent_memory.OllamaConfig(endpoint="http://ollama.local:11434", model="model")
+
+
+def test_discover_ollama_fingerprint_uses_reported_version_and_model_digest() -> None:
+    calls = []
+
+    def request_json(method: str, url: str, payload: dict | None, **limits):
+        calls.append((method, url, payload, limits))
+        if url.endswith("/api/version"):
+            return {"version": "0.11.4"}
+        return {
+            "models": [
+                {"name": "other:latest", "digest": "sha256:other"},
+                {"name": "nomic-embed-text:v1.5", "digest": "sha256:expected"},
+            ]
+        }
+
+    config = agent_memory.OllamaConfig(
+        endpoint="http://127.0.0.1:11434",
+        model="nomic-embed-text:v1.5",
+    )
+    fingerprint = agent_memory.discover_ollama_fingerprint(config, request_json=request_json)
+
+    assert fingerprint.server_version == "0.11.4"
+    assert fingerprint.model_digest == "sha256:expected"
+    assert [(call[0], call[1], call[2]) for call in calls] == [
+        ("GET", "http://127.0.0.1:11434/api/version", None),
+        ("GET", "http://127.0.0.1:11434/api/tags", None),
+    ]
+    assert all(call[3] == {"timeout": 10.0, "max_bytes": 8_000_000} for call in calls)
+
+
+def test_ollama_http_opener_disables_proxies_and_redirects() -> None:
+    opener = agent_memory._build_ollama_opener()
+    redirect_handler = next(
+        handler
+        for handler in opener.handlers
+        if isinstance(handler, agent_memory._RejectRedirects)
+    )
+
+    assert not any(isinstance(handler, agent_memory.ProxyHandler) for handler in opener.handlers)
+    with pytest.raises(agent_memory.HTTPError):
+        redirect_handler.redirect_request(
+            None,
+            None,
+            302,
+            "redirect",
+            {},
+            "http://127.0.0.1:11434/elsewhere",
+        )
+
+
+def test_ollama_request_json_uses_bounded_explicit_request() -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            assert size == 1025
+            return b'{"embeddings":[[1.0,0.0]]}'
+
+    class Opener:
+        request = None
+        timeout = None
+
+        def open(self, request, timeout: float):
+            self.request = request
+            self.timeout = timeout
+            return Response()
+
+    opener = Opener()
+    result = agent_memory.ollama_request_json(
+        "POST",
+        "http://127.0.0.1:11434/api/embed",
+        {"model": "model", "input": ["query"]},
+        timeout=3.0,
+        max_bytes=1024,
+        opener=opener,
+        acceptance_scope=OPERATOR_SCOPE,
+    )
+
+    assert result == {"embeddings": [[1.0, 0.0]]}
+    assert opener.timeout == 3.0
+    assert opener.request.full_url == "http://127.0.0.1:11434/api/embed"
+    assert opener.request.get_method() == "POST"
+    assert json.loads(opener.request.data) == {"model": "model", "input": ["query"]}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://192.168.1.2:11434/api/embed",
+        "http://localhost:11434/api/embed",
+        "http://127.0.0.1:11434/api/pull",
+        "http://127.0.0.1:11434/api/embed?remote=yes",
+    ],
+)
+def test_ollama_request_json_rejects_remote_or_unapproved_urls(url: str) -> None:
+    with pytest.raises(ValueError, match="Ollama request URL"):
+        agent_memory.ollama_request_json(
+            "GET", url, None, timeout=1.0, max_bytes=1024, opener=object()
+        )
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [(b"12345", "size limit"), (b"not-json", "malformed JSON")],
+)
+def test_ollama_request_json_rejects_oversized_or_malformed_responses(
+    body: bytes, error: str
+) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            return body
+
+    class Opener:
+        def open(self, request, timeout: float):
+            return Response()
+
+    with pytest.raises(ValueError, match=error):
+        agent_memory.ollama_request_json(
+            "GET",
+            "http://127.0.0.1:11434/api/version",
+            None,
+            timeout=1.0,
+            max_bytes=4 if len(body) == 5 else 100,
+            opener=Opener(),
+        )
+
+
+def test_embed_ollama_prefixes_inputs_and_rechecks_provider_identity() -> None:
+    calls = []
+
+    def request_json(method: str, url: str, payload: dict | None, **limits):
+        calls.append((method, url, payload))
+        if url.endswith("/api/version"):
+            return {"version": "0.11.4"}
+        if url.endswith("/api/tags"):
+            return {
+                "models": [
+                    {"name": "nomic-embed-text:v1.5", "digest": "sha256:expected"}
+                ]
+            }
+        return {"embeddings": [[3.0, 4.0]]}
+
+    config = agent_memory.OllamaConfig(
+        endpoint="http://127.0.0.1:11434", model="nomic-embed-text:v1.5"
+    )
+    identity = agent_memory.discover_ollama_fingerprint(config, request_json=request_json)
+    calls.clear()
+
+    vectors = agent_memory.embed_ollama(
+        ["portable memory"],
+        purpose="query",
+        config=config,
+        fingerprint=identity,
+        request_json=request_json,
+        acceptance_scope=OPERATOR_SCOPE,
+    )
+
+    assert vectors == [[3.0, 4.0]]
+    assert calls[2] == (
+        "POST",
+        "http://127.0.0.1:11434/api/embed",
+        {
+            "model": "nomic-embed-text:v1.5",
+            "input": ["search_query: portable memory"],
+            "truncate": False,
+        },
+    )
+    assert [url.rsplit("/", 1)[-1] for _, url, _ in calls] == [
+        "version", "tags", "embed", "version", "tags"
+    ]
+
+
+def test_encode_embedding_vector_normalizes_finite_little_endian_float32() -> None:
+    encoded = agent_memory.encode_embedding_vector([3.0, 4.0])
+
+    assert encoded.dimensions == 2
+    assert encoded.data == struct.pack("<2f", 0.6, 0.8)
+    assert encoded.vector_hash == hashlib.sha256(encoded.data).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [[], [0.0, 0.0], [float("nan")], [float("inf")], [True, 1.0]],
+)
+def test_encode_embedding_vector_rejects_invalid_values(values: list) -> None:
+    with pytest.raises(ValueError, match="embedding vector"):
+        agent_memory.encode_embedding_vector(values)
+
+
+def test_embedding_sync_caches_unchanged_canonical_document_inputs(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="embed-id",
+        title="Embedding title",
+        summary="Embedding summary",
+        message="Embedding message",
+    )
+    calls = []
+
+    def embed_documents(texts: list[str]) -> list[list[float]]:
+        calls.append(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+
+    first = agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        embed_documents,
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+    second = agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        embed_documents,
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+
+    assert first == {"added": 1, "updated": 0, "removed": 0, "unchanged": 0}
+    assert second == {"added": 0, "updated": 0, "removed": 0, "unchanged": 1}
+    assert calls == [["Embedding title\n\nEmbedding summary\n\nEmbedding message"]]
+
+
+def test_embedding_status_requires_complete_integral_single_dimension_coverage(
+    tmp_path: Path,
+) -> None:
+    write_action(tmp_path, memory_uuid="first-vector", message="first")
+    write_action(tmp_path, memory_uuid="second-vector", message="second")
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        lambda texts: [[1.0, 0.0] for _ in texts],
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+
+    status = agent_memory.memory_embedding_status(tmp_path, identity)
+    assert status["ok"] is True
+    assert status["document_count"] == status["vector_count"] == 2
+    assert status["dimensions"] == 2
+
+    with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+        connection.execute(
+            "DELETE FROM document_embeddings WHERE memory_uuid = 'second-vector'"
+        )
+        connection.commit()
+    status = agent_memory.memory_embedding_status(tmp_path, identity)
+    assert status["ok"] is False
+    assert status["reason"] == "embedding_coverage_incomplete"
+
+
+def test_query_embedding_cache_reuses_vector_without_storing_query_text(tmp_path: Path) -> None:
+    agent_memory.sync_memory_index(tmp_path)
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    calls = []
+
+    def embed_query(texts: list[str]) -> list[list[float]]:
+        calls.append(texts)
+        return [[0.0, 1.0]]
+
+    first = agent_memory.get_or_create_query_embedding(
+        tmp_path,
+        identity,
+        "private query text",
+        embed_query,
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+    second = agent_memory.get_or_create_query_embedding(
+        tmp_path,
+        identity,
+        "private query text",
+        embed_query,
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+
+    assert first == second
+    assert calls == [["private query text"]]
+    assert b"private query text" not in agent_memory.memory_index_path(tmp_path).read_bytes()
+
+
+def test_semantic_search_orders_by_cosine_and_preserves_provenance(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="closest", message="closest semantic memory")
+    write_action(tmp_path, memory_uuid="farther", message="farther semantic memory")
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        lambda texts: [[1.0, 0.0] if "closest" in text else [0.0, 1.0] for text in texts],
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+
+    results = agent_memory.search_semantic_documents(
+        tmp_path,
+        "related idea",
+        identity,
+        lambda texts: [[1.0, 0.0]],
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+
+    assert [result.memory_uuid for result in results] == ["closest", "farther"]
+    assert results[0].score == pytest.approx(1.0)
+    assert results[0].matched_field == "semantic"
+    assert results[0].relative_path.endswith("event-closest.md")
+
+
+def test_reciprocal_rank_fusion_uses_positions_and_deterministic_ties() -> None:
+    def result(memory_uuid: str, timestamp: str, score: float) -> agent_memory.SearchResult:
+        return agent_memory.SearchResult(
+            timestamp=timestamp,
+            memory_uuid=memory_uuid,
+            agent="agent",
+            session="session",
+            event_type="message",
+            relative_path=f"actions/{memory_uuid}.md",
+            matched_field="message",
+            snippet=memory_uuid,
+            score=score,
+        )
+
+    shared = result("shared", "2026-07-21T12:00:00Z", 0.0001)
+    older = result("older", "2026-07-21T11:00:00Z", 999999.0)
+    newer = result("newer", "2026-07-21T13:00:00Z", -100.0)
+
+    fused = agent_memory.reciprocal_rank_fusion(
+        [[shared, older], [shared, newer]], k=60, limit=3
+    )
+
+    assert [item.memory_uuid for item in fused] == ["shared", "newer", "older"]
+    assert fused[0].score == pytest.approx(2 / 61)
+    assert fused[1].score == fused[2].score == pytest.approx(1 / 62)
+    assert all(item.matched_field == "hybrid" for item in fused)
+
+
+@pytest.mark.parametrize("scope", ["child", "deterministic", "reviewed-generative"])
+def test_model_derived_embeddings_reject_non_generative_scopes(
+    tmp_path: Path, scope: str
+) -> None:
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    with pytest.raises(ValueError, match="acceptance scope"):
+        agent_memory.sync_memory_embeddings(
+            tmp_path,
+            identity,
+            lambda texts: [],
+            acceptance_scope=scope,
+            cache_policy=LOCAL_CACHE,
+        )
+    with pytest.raises(ValueError, match="acceptance scope"):
+        agent_memory.get_or_create_query_embedding(
+            tmp_path,
+            identity,
+            "query",
+            lambda texts: [[1.0]],
+            acceptance_scope=scope,
+            cache_policy=LOCAL_CACHE,
+        )
+
+
+def test_direct_ollama_embed_requires_typed_operator_scope_before_http() -> None:
+    with pytest.raises(ValueError, match="acceptance scope"):
+        agent_memory.ollama_request_json(
+            "POST",
+            "http://127.0.0.1:11434/api/embed",
+            {"model": "model", "input": ["must not send"]},
+            timeout=1.0,
+            max_bytes=1024,
+            opener=object(),
+        )
+
+
+def test_operator_embedding_storage_requires_explicit_cache_opt_in(tmp_path: Path) -> None:
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    with pytest.raises(ValueError, match="cache policy"):
+        agent_memory.sync_memory_embeddings(
+            tmp_path,
+            identity,
+            lambda texts: [],
+            acceptance_scope=OPERATOR_SCOPE,
+            cache_policy=agent_memory.EmbeddingCachePolicy.NO_STORE,
+        )
+    with pytest.raises(ValueError, match="cache policy"):
+        agent_memory.get_or_create_query_embedding(
+            tmp_path,
+            identity,
+            "query",
+            lambda texts: [[1.0]],
+            acceptance_scope=OPERATOR_SCOPE,
+            cache_policy=agent_memory.EmbeddingCachePolicy.NO_STORE,
+        )
+
+
+def test_semantic_search_rechecks_coverage_after_query_embedding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_action(tmp_path, memory_uuid="race-vector", message="race")
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        lambda texts: [[1.0, 0.0]],
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+    real_get = agent_memory.get_or_create_query_embedding
+
+    def remove_vector_after_query(*args, **kwargs):
+        result = real_get(*args, **kwargs)
+        with sqlite3.connect(agent_memory.memory_index_path(tmp_path)) as connection:
+            connection.execute("DELETE FROM document_embeddings")
+            connection.commit()
+        return result
+
+    monkeypatch.setattr(
+        agent_memory, "get_or_create_query_embedding", remove_vector_after_query
+    )
+    with pytest.raises(ValueError, match="embedding_coverage_incomplete"):
+        agent_memory.search_semantic_documents(
+            tmp_path,
+            "query",
+            identity,
+            lambda texts: [[1.0, 0.0]],
+            acceptance_scope=OPERATOR_SCOPE,
+            cache_policy=LOCAL_CACHE,
+        )
+
+
+def test_metadata_only_document_update_does_not_reembed_unchanged_content(
+    tmp_path: Path,
+) -> None:
+    path = write_action(tmp_path, memory_uuid="metadata-vector", message="same content")
+    identity = agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="0.11.4",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+    calls = []
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        calls.append(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+    agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        embed,
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "2026-07-21T12:00:00Z", "2026-07-21T12:01:00Z"
+        ),
+        encoding="utf-8",
+    )
+    result = agent_memory.sync_memory_embeddings(
+        tmp_path,
+        identity,
+        embed,
+        acceptance_scope=OPERATOR_SCOPE,
+        cache_policy=LOCAL_CACHE,
+    )
+
+    assert result["unchanged"] == 1
+    assert calls == [["Example title\n\nExample summary\n\nsame content"]]

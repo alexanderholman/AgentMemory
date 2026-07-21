@@ -96,6 +96,30 @@ Search modes are:
 - `index`: require the SQLite index and fail if it is unavailable;
 - `scan`: bypass SQLite and use the deterministic Markdown fallback.
 
+`--mode` selects only the text backend. Text retrieval remains the default and
+keeps the existing bare JSON array output. Operator-only semantic retrieval is
+an independent, explicit mode:
+
+```bash
+memlog search "routing decision" --root ~/opencode \
+  --retrieval semantic \
+  --ollama-endpoint http://127.0.0.1:11434 \
+  --ollama-model nomic-embed-text:v1.5 \
+  --embedding-cache local-private \
+  --format json
+```
+
+`--retrieval hybrid` deterministically fuses text and semantic rankings. Both
+semantic modes require every Ollama and cache option shown above; AgentMemory
+does not read provider defaults from the environment, start Ollama, or download
+models. They fail closed on provider, configuration, or embedding-integrity
+errors. Hybrid may return text results only with
+`--allow-hybrid-text-fallback`; JSON then reports a degraded `RetrievalOutcome`,
+and text output prints a warning with a fixed reason code.
+
+Hybrid result limits are capped at 470 so both source rankings can be fetched
+deeply enough (`60 + 2 × limit`, at most 1000) for exact two-list RRF results.
+
 Corrupt indexes are rebuilt only for recognized corruption errors. Lock
 contention is never treated as corruption, and symlinked or hardlinked index
 paths are rejected. SQLite operates on verified private snapshots and installs
@@ -157,10 +181,15 @@ Markdown action documents remain authoritative. Search databases, embeddings,
 profiles, and graph scores are disposable projections that must be rebuildable
 from those documents.
 
+The execution order and AgentFramework integration boundary are defined in
+[Retrieval Architecture](RETRIEVAL_ARCHITECTURE.md). Deterministic text
+retrieval remains first and model-backed embeddings never produce user-facing
+answers.
+
 Planned incremental layers are:
 
 1. ~~SQLite FTS5 catalog with direct-scan fallback.~~
-2. Explicitly configured local embeddings and hybrid retrieval.
+2. ~~Explicitly configured local embeddings and hybrid retrieval.~~
 3. Provenance-backed profile candidates requiring approval before injection.
 4. Opt-in, token-budgeted context construction that quotes memories as
    untrusted data.

@@ -79,6 +79,7 @@ class ActionDocument:
     message: str
     relative_path: str
     source_bytes: int
+    source_text: str
 
 
 @dataclass
@@ -272,10 +273,6 @@ def redact_text(content: str) -> tuple[str, bool]:
         token = match.group(0)
         if token.count("-") >= 4:
             return token
-        before = redacted[match.start() - 1] if match.start() else ""
-        after = redacted[match.end()] if match.end() < len(redacted) else ""
-        if before == "/" or after == "/" or (before == "`" and after == "`"):
-            return token
         touched = True
         return "[REDACTED_TOKEN]"
 
@@ -292,28 +289,38 @@ def summarize(text: str, max_lines: int = 8, max_chars: int = 800) -> str:
     return clipped or "(empty)"
 
 
-def _section(text: str, heading: str, end_heading: str) -> str:
-    marker = f"## {heading}\n"
-    if marker not in text:
-        return ""
-    content = text.split(marker, 1)[1]
-    end_marker = f"\n## {end_heading}\n"
-    if end_marker not in content:
-        return ""
-    if end_heading == "Tool Outputs (summarized)":
-        offset = 0
-        while True:
-            boundary = content.find(end_marker, offset)
-            if boundary < 0:
-                return ""
-            following = content[boundary + len(end_marker) :]
-            if (
-                (following.startswith("- none") or following.startswith("- tool:"))
-                and "\n## Raw Output Links\n" in following
-            ):
-                return content[:boundary].strip()
-            offset = boundary + len(end_marker)
-    return content.split(end_marker, 1)[0].strip()
+def _generated_tool_boundary(text: str) -> int | None:
+    marker = "\n## Tool Outputs (summarized)\n"
+    offset = 0
+    while True:
+        boundary = text.find(marker, offset)
+        if boundary < 0:
+            return None
+        following = text[boundary + len(marker) :]
+        if (
+            (following.startswith("- none") or following.startswith("- tool:"))
+            and "\n## Raw Output Links\n" in following
+        ):
+            return boundary
+        offset = boundary + len(marker)
+
+
+def parse_memory_sections(body: str) -> tuple[str, str]:
+    summary_marker = "## Summary\n"
+    full_message_marker = "\n## Full Message\n"
+    if summary_marker not in body:
+        return "", ""
+    content = body.split(summary_marker, 1)[1]
+    tool_boundary = _generated_tool_boundary(content)
+    if tool_boundary is None:
+        return "", ""
+    searchable = content[:tool_boundary]
+    boundaries = [match.start() for match in re.finditer(re.escape(full_message_marker), searchable)]
+    if not boundaries:
+        return searchable.strip(), ""
+    summary = searchable[: boundaries[0]].strip()
+    message = searchable[boundaries[-1] + len(full_message_marker) :].strip()
+    return summary, message
 
 
 def read_canonical_file(path: Path, root: Path, max_bytes: int) -> tuple[str, str, int]:
@@ -369,6 +376,7 @@ def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) ->
         if line.startswith("# "):
             title = line[2:].strip()
             break
+    summary, message = parse_memory_sections(body)
     return ActionDocument(
         timestamp=metadata["timestamp"],
         memory_uuid=metadata["memory_uuid"],
@@ -376,10 +384,11 @@ def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) ->
         session=metadata["session_id"],
         event_type=metadata["event_type"],
         title=title,
-        summary=_section(body, "Summary", "Full Message"),
-        message=_section(body, "Full Message", "Tool Outputs (summarized)"),
+        summary=summary,
+        message=message,
         relative_path=relative_path,
         source_bytes=source_bytes,
+        source_text=text,
     )
 
 
@@ -715,13 +724,15 @@ def command_log(args: argparse.Namespace) -> int:
 def canonical_action_preview(entry: IndexEntry, root: Path, max_chars: int) -> tuple[Path | None, str | None, str | None]:
     try:
         action_path = link_to_path(entry.action_link, root)
-        if action_path.suffix != ".md":
-            raise ValueError("action link does not reference canonical Markdown")
-        parse_action_document(action_path, root)
-        text, _, _ = read_canonical_file(action_path, root, 1_000_000)
-        return action_path, summarize(text, max_lines=12, max_chars=max_chars), None
-    except (OSError, UnicodeError, ValueError) as exc:
+    except ValueError as exc:
         return None, None, f"unsafe action link: {exc}"
+    if action_path.suffix != ".md":
+        return action_path, None, "unsafe action link: action link does not reference canonical Markdown"
+    try:
+        document = parse_action_document(action_path, root)
+        return action_path, summarize(document.source_text, max_lines=12, max_chars=max_chars), None
+    except (OSError, UnicodeError, ValueError) as exc:
+        return action_path, None, f"unsafe action link: {exc}"
 
 
 def command_load(args: argparse.Namespace) -> int:
@@ -785,27 +796,40 @@ def command_load(args: argparse.Namespace) -> int:
             }
             if args.with_action:
                 action_path, preview, error = canonical_action_preview(entry, root, 1600)
-                if action_path and preview:
+                if action_path:
                     row["action_path"] = action_path.as_posix()
+                if preview:
                     row["action_preview"] = preview
-                else:
+                if error:
                     row["action_error"] = error
             payload.append(row)
         print(json.dumps(payload, indent=2))
         return 0
 
     for entry in entries:
+        safe_values = [
+            single_line_text(value, max_chars=500)
+            for value in (
+                entry.timestamp,
+                entry.memory_uuid,
+                entry.agent,
+                entry.session,
+                entry.event_type,
+                entry.action_link,
+                entry.summary,
+            )
+        ]
         print(
-            f"{entry.timestamp} | {entry.memory_uuid} | {entry.agent} | "
-            f"{entry.session} | {entry.event_type} | {entry.action_link} | {entry.summary}"
+            f"{safe_values[0]} | {safe_values[1]} | {safe_values[2]} | "
+            f"{safe_values[3]} | {safe_values[4]} | {safe_values[5]} | {safe_values[6]}"
         )
         if args.with_action:
             action_path, preview, error = canonical_action_preview(entry, root, 1200)
             if action_path and preview:
-                print(f"  action: {action_path}")
-                print(f"  preview: {preview}")
+                print(f"  action: {single_line_text(action_path.as_posix(), max_chars=500)}")
+                print(f"  preview: {single_line_text(preview, max_chars=1200)}")
             else:
-                print(f"  action: rejected ({error})")
+                print(f"  action: rejected ({single_line_text(error or 'unknown error', max_chars=500)})")
 
     return 0
 

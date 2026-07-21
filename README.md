@@ -95,7 +95,10 @@ Search modes are:
 
 Corrupt indexes are rebuilt only for recognized corruption errors. Lock
 contention is never treated as corruption, and symlinked or hardlinked index
-paths are rejected.
+paths are rejected. SQLite operates on verified private snapshots and installs
+updates atomically; failed installation restores the prior inode. Canonical
+WAL, shared-memory, or hot-journal sidecars force `auto` mode to use the
+Markdown scan rather than risk stale indexed results.
 
 Validate links and orphan raw artifacts:
 

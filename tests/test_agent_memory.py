@@ -276,7 +276,7 @@ def test_agent_index_is_keyed_by_stable_agent_id(
     assert (tmp_path / "memory" / "agents" / "pr.command.zordon.md").is_file()
 
 
-def test_agent_load_falls_back_to_legacy_name_keyed_indexes(
+def test_agent_load_does_not_trust_unrelated_legacy_indexes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     legacy = tmp_path / "memory" / "agents" / "Zordon.md"
@@ -304,5 +304,154 @@ def test_agent_load_falls_back_to_legacy_name_keyed_indexes(
     )
 
     assert args.func(args) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload[0]["memory_uuid"] == "legacy-id"
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_search_preserves_markdown_headings_inside_message(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="heading-id",
+        message="Before\n\n## User heading\n\nneedle after heading",
+    )
+
+    results = agent_memory.search_action_documents(tmp_path, "needle")
+
+    assert results[0].memory_uuid == "heading-id"
+
+
+def test_search_compares_timezone_aware_timestamps(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="offset-id",
+        timestamp="2026-07-21T12:00:00+02:00",
+        message="timezone memory",
+    )
+
+    results = agent_memory.search_action_documents(
+        tmp_path,
+        "timezone",
+        since="2026-07-21T09:59:59Z",
+        until="2026-07-21T10:00:01Z",
+    )
+
+    assert results[0].memory_uuid == "offset-id"
+
+
+def test_search_redacts_historical_secret_fields(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="secret-id",
+        title="api_key: LEAKME123",
+        summary="password: NeverPrintThis",
+        message="safe searchable marker",
+    )
+
+    results = agent_memory.search_action_documents(tmp_path, "safe searchable")
+
+    rendered = json.dumps(results[0].as_dict())
+    assert "LEAKME123" not in rendered
+    assert "NeverPrintThis" not in rendered
+
+
+def test_search_normalizes_terminal_controls_in_snippets(tmp_path: Path) -> None:
+    write_action(
+        tmp_path,
+        memory_uuid="control-id",
+        message="needle\nforged row\x1b[31m",
+    )
+
+    result = agent_memory.search_action_documents(tmp_path, "needle")[0]
+
+    assert "\n" not in result.snippet
+    assert "\x1b" not in result.snippet
+
+
+def test_search_bounds_unique_query_terms(tmp_path: Path) -> None:
+    query = " ".join(f"term{index}" for index in range(33))
+    with pytest.raises(ValueError, match="too many unique terms"):
+        agent_memory.search_action_documents(tmp_path, query)
+
+
+def test_validate_reports_escaping_links_instead_of_crashing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    action = write_action(tmp_path, memory_uuid="unsafe-link-id")
+    action.write_text(action.read_text(encoding="utf-8") + "[[../outside]]\n", encoding="utf-8")
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(["validate", "--root", str(tmp_path), "--strict"])
+
+    assert args.func(args) == 1
+    assert "unsafe_memory_link" in capsys.readouterr().out
+
+
+def test_log_allows_safe_display_name_with_spaces(tmp_path: Path) -> None:
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        [
+            "log",
+            "--root",
+            str(tmp_path),
+            "--agent-id",
+            "pr.command.zordon",
+            "--agent-name",
+            "Zordon Command Agent",
+            "--session-id",
+            "ses_test",
+            "--message",
+            "I will preserve display name compatibility",
+        ]
+    )
+
+    assert args.func(args) == 0
+
+
+def test_log_redacts_explicit_title_and_summary(tmp_path: Path) -> None:
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        [
+            "log",
+            "--root",
+            str(tmp_path),
+            "--agent-id",
+            "pr.command.zordon",
+            "--session-id",
+            "ses_test",
+            "--title",
+            "api_key: LEAKME123",
+            "--summary",
+            "password: NeverPrintThis",
+            "--message",
+            "I will test explicit metadata redaction",
+        ]
+    )
+
+    assert args.func(args) == 0
+    action = next((tmp_path / "actions").glob("*/*/*.md"))
+    persisted = action.read_text(encoding="utf-8")
+    assert "LEAKME123" not in persisted
+    assert "NeverPrintThis" not in persisted
+    assert "[REDACTED]" in persisted
+
+
+def test_search_rejects_invalid_time_bound(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid since timestamp"):
+        agent_memory.search_action_documents(tmp_path, "memory", since="not-a-time")
+
+
+def test_search_skips_document_with_invalid_timestamp(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="invalid-time-id", timestamp="not-a-time", message="needle")
+    assert agent_memory.search_action_documents(tmp_path, "needle") == []
+
+
+def test_redaction_preserves_long_alphabetic_identifiers() -> None:
+    identifier = "AgentMemoryCanonicalIdentifierName"
+    redacted, touched = agent_memory.redact_text(identifier)
+    assert redacted == identifier
+    assert touched is False
+
+
+def test_redaction_still_masks_long_token_like_values() -> None:
+    token = "abcDEF0123456789abcDEF0123456789"
+    redacted, touched = agent_memory.redact_text(token)
+    assert redacted == "[REDACTED_TOKEN]"
+    assert touched is True

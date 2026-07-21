@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -77,6 +78,7 @@ class ActionDocument:
     summary: str
     message: str
     relative_path: str
+    source_bytes: int
 
 
 @dataclass
@@ -130,6 +132,37 @@ def validate_identifier(value: str, label: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
         raise ValueError(f"{label} contains unsupported characters")
     return value
+
+
+def normalize_identifier(value: str, label: str) -> str:
+    if not value or value in {".", ".."} or re.search(r"[\\/\x00-\x1f\x7f]", value):
+        raise ValueError(f"{label} is empty or contains traversal characters")
+    normalized = safe_name(value)
+    return validate_identifier(normalized, label)
+
+
+def validate_display_name(value: str) -> str:
+    if not value or len(value) > 200 or re.search(r"[\x00-\x1f\x7f]", value):
+        raise ValueError("agent name must be a non-empty single-line value")
+    return value
+
+
+def parse_timestamp(value: str, label: str = "timestamp") -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid {label}: {value}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def single_line_text(value: str, max_chars: int = 280) -> str:
+    without_controls = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value)
+    collapsed = re.sub(r"\s+", " ", without_controls).strip()
+    if len(collapsed) > max_chars:
+        return collapsed[: max_chars - 3] + "..."
+    return collapsed or "(empty)"
 
 
 def wiki_link(path: Path, root: Path) -> str:
@@ -232,10 +265,16 @@ def redact_text(content: str) -> tuple[str, bool]:
         if count > 0:
             touched = True
 
-    entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{24,}\b")
+    # Avoid destroying useful memory such as paths and long identifiers. Only
+    # mask long values that contain characters commonly present in secrets.
+    entropy_like = re.compile(r"\b[A-Za-z0-9+/=_-]{32,}\b")
     matches = set(entropy_like.findall(redacted))
     for token in matches:
         if token.count("-") >= 4:
+            continue
+        if re.fullmatch(r"[A-Za-z/]+", token):
+            continue
+        if not re.search(r"[0-9+=_]", token):
             continue
         redacted = redacted.replace(token, "[REDACTED_TOKEN]")
         touched = True
@@ -251,27 +290,43 @@ def summarize(text: str, max_lines: int = 8, max_chars: int = 800) -> str:
     return clipped or "(empty)"
 
 
-def _section(text: str, heading: str) -> str:
+def _section(text: str, heading: str, end_heading: str) -> str:
     marker = f"## {heading}\n"
     if marker not in text:
         return ""
     content = text.split(marker, 1)[1]
-    return content.split("\n## ", 1)[0].strip()
+    end_marker = f"\n## {end_heading}\n"
+    if end_marker not in content:
+        return ""
+    return content.rsplit(end_marker, 1)[0].strip()
+
+
+def read_canonical_file(path: Path, root: Path, max_bytes: int) -> tuple[str, str, int]:
+    root_resolved = root.resolve()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("canonical action cannot be opened safely") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("canonical action must be a regular file")
+        if details.st_size > max_bytes:
+            raise ValueError("canonical action exceeds size limit")
+        descriptor_path = Path(f"/proc/self/fd/{descriptor}").resolve()
+        try:
+            relative_path = descriptor_path.relative_to(root_resolved).as_posix()
+        except ValueError as exc:
+            raise ValueError("canonical action escapes memory root") from exc
+        with os.fdopen(os.dup(descriptor), "r", encoding="utf-8") as handle:
+            return handle.read(max_bytes + 1), relative_path, details.st_size
+    finally:
+        os.close(descriptor)
 
 
 def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) -> ActionDocument:
-    root_resolved = root.resolve()
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("canonical action must be a regular, non-symlink file")
-    resolved = path.resolve()
-    try:
-        relative_path = resolved.relative_to(root_resolved).as_posix()
-    except ValueError as exc:
-        raise ValueError("canonical action escapes memory root") from exc
-    if path.stat().st_size > max_bytes:
-        raise ValueError("canonical action exceeds size limit")
-
-    text = path.read_text(encoding="utf-8")
+    text, relative_path, source_bytes = read_canonical_file(path, root, max_bytes)
     if not text.startswith("---\n") or "\n---\n" not in text[4:]:
         raise ValueError("canonical action has invalid front matter")
     front_matter, body = text[4:].split("\n---\n", 1)
@@ -288,6 +343,8 @@ def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) ->
     required = ("timestamp", "memory_uuid", "agent_id", "session_id", "event_type")
     if any(not metadata.get(field) for field in required):
         raise ValueError("canonical action is missing required metadata")
+    parse_timestamp(metadata["timestamp"])
+    validate_identifier(metadata["memory_uuid"], "memory UUID")
     validate_identifier(metadata["agent_id"], "agent id")
     validate_identifier(metadata["session_id"], "session id")
     validate_identifier(metadata["event_type"], "event type")
@@ -304,9 +361,10 @@ def parse_action_document(path: Path, root: Path, max_bytes: int = 1_000_000) ->
         session=metadata["session_id"],
         event_type=metadata["event_type"],
         title=title,
-        summary=_section(body, "Summary"),
-        message=_section(body, "Full Message"),
+        summary=_section(body, "Summary", "Full Message"),
+        message=_section(body, "Full Message", "Tool Outputs (summarized)"),
         relative_path=relative_path,
+        source_bytes=source_bytes,
     )
 
 
@@ -315,9 +373,11 @@ def _query_terms(query: str) -> list[str]:
         raise ValueError("search query must not be empty")
     if len(query) > 1000:
         raise ValueError("search query exceeds size limit")
-    terms = re.findall(r"\w+", query.casefold(), flags=re.UNICODE)
+    terms = list(dict.fromkeys(re.findall(r"\w+", query.casefold(), flags=re.UNICODE)))
     if not terms:
         raise ValueError("search query must contain searchable characters")
+    if len(terms) > 32:
+        raise ValueError("search query contains too many unique terms")
     return terms
 
 
@@ -345,11 +405,15 @@ def search_action_documents(
     if limit < 1 or limit > 1000:
         raise ValueError("limit must be between 1 and 1000")
     if agent_id:
-        validate_identifier(agent_id, "agent id")
+        agent_id = normalize_identifier(agent_id, "agent id")
     if session_id:
-        validate_identifier(session_id, "session id")
+        session_id = normalize_identifier(session_id, "session id")
     if event_type:
-        validate_identifier(event_type, "event type")
+        event_type = normalize_identifier(event_type, "event type")
+    since_value = parse_timestamp(since, "since timestamp") if since else None
+    until_value = parse_timestamp(until, "until timestamp") if until else None
+    if since_value and until_value and since_value > until_value:
+        raise ValueError("since timestamp must not be after until timestamp")
 
     action_root = root / "actions"
     if not action_root.is_dir() or action_root.is_symlink():
@@ -357,6 +421,8 @@ def search_action_documents(
 
     results: list[SearchResult] = []
     field_order = {"title": 0, "summary": 1, "message": 2}
+    scanned_files = 0
+    scanned_bytes = 0
     for current_dir, dirs, files in os.walk(action_root, followlinks=False):
         dirs[:] = sorted(name for name in dirs if name != "raw")
         for filename in sorted(files):
@@ -367,23 +433,28 @@ def search_action_documents(
                 document = parse_action_document(path, root)
             except (OSError, UnicodeError, ValueError):
                 continue
+            scanned_files += 1
+            scanned_bytes += document.source_bytes
+            if scanned_files > 10_000 or scanned_bytes > 50_000_000:
+                raise ValueError("search scan exceeds configured resource limits")
             if agent_id and document.agent != agent_id:
                 continue
             if session_id and document.session != session_id:
                 continue
             if event_type and document.event_type != event_type:
                 continue
-            if since and document.timestamp < since:
+            document_timestamp = parse_timestamp(document.timestamp)
+            if since_value and document_timestamp < since_value:
                 continue
-            if until and document.timestamp > until:
+            if until_value and document_timestamp > until_value:
                 continue
 
             candidates = []
             for field in ("title", "summary", "message"):
-                content = getattr(document, field)
+                content, _ = redact_text(getattr(document, field))
                 score = _matching_score(content, terms)
                 if score:
-                    candidates.append((score, field_order[field], field, summarize(content, max_lines=3, max_chars=280)))
+                    candidates.append((score, field_order[field], field, single_line_text(content)))
             if not candidates:
                 continue
             score, _, matched_field, snippet = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
@@ -401,7 +472,7 @@ def search_action_documents(
                 )
             )
 
-    results.sort(key=lambda item: (item.timestamp, item.memory_uuid), reverse=True)
+    results.sort(key=lambda item: (parse_timestamp(item.timestamp), item.memory_uuid), reverse=True)
     results.sort(key=lambda item: (-item.score, field_order[item.matched_field]))
     return results[:limit]
 
@@ -483,10 +554,10 @@ def command_log(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     ensure_layout(root)
 
-    agent_id = validate_identifier(args.agent_id, "agent id")
-    agent_name = validate_identifier(args.agent_name or agent_id, "agent name")
-    session_id = validate_identifier(args.session_id, "session id")
-    event_type = validate_identifier(args.event_type, "event type")
+    agent_id = normalize_identifier(args.agent_id, "agent id")
+    agent_name = validate_display_name(args.agent_name or agent_id)
+    session_id = normalize_identifier(args.session_id, "session id")
+    event_type = normalize_identifier(args.event_type, "event type")
     model = args.model or "unknown"
     provider = args.provider or "unknown"
     variant = args.variant or "unknown"
@@ -549,8 +620,11 @@ def command_log(args: argparse.Namespace) -> int:
     if state.get("last_event"):
         previous_link = wiki_link(root / state["last_event"], root)
 
-    title = args.title or f"{event_type} from {agent_name}"
-    summary_text = args.summary or summarize(message_redacted, max_lines=3, max_chars=280)
+    title, title_masked = redact_text(args.title or f"{event_type} from {agent_name}")
+    summary_text, summary_masked = redact_text(
+        args.summary or summarize(message_redacted, max_lines=3, max_chars=280)
+    )
+    any_redacted = any_redacted or title_masked or summary_masked
 
     tool_lines = "- none"
     if tool_redacted:
@@ -623,32 +697,20 @@ def command_load(args: argparse.Namespace) -> int:
     elif source == "agent":
         if not args.agent_id:
             raise SystemExit("--agent-id is required when --source agent")
-        path = root / "memory" / "agents" / f"{validate_identifier(args.agent_id, 'agent id')}.md"
+        path = root / "memory" / "agents" / f"{normalize_identifier(args.agent_id, 'agent id')}.md"
     else:
         if not args.session_id:
             raise SystemExit("--session-id is required when --source session")
-        path = root / "memory" / "sessions" / f"{validate_identifier(args.session_id, 'session id')}.md"
+        path = root / "memory" / "sessions" / f"{normalize_identifier(args.session_id, 'session id')}.md"
 
-    if source == "agent":
-        entries = []
-        seen_memory_uuids: set[str] = set()
-        agent_dir = root / "memory" / "agents"
-        for item in sorted(os.scandir(agent_dir), key=lambda candidate: candidate.name):
-            if not item.name.endswith(".md") or not item.is_file(follow_symlinks=False):
-                continue
-            for entry in load_index_entries(Path(item.path)):
-                if entry.memory_uuid not in seen_memory_uuids:
-                    entries.append(entry)
-                    seen_memory_uuids.add(entry.memory_uuid)
-    else:
-        entries = load_index_entries(path)
+    entries = load_index_entries(path)
 
     if args.agent_id:
-        entries = [entry for entry in entries if entry.agent == validate_identifier(args.agent_id, "agent id")]
+        entries = [entry for entry in entries if entry.agent == normalize_identifier(args.agent_id, "agent id")]
     if args.session_id:
-        entries = [entry for entry in entries if entry.session == validate_identifier(args.session_id, "session id")]
+        entries = [entry for entry in entries if entry.session == normalize_identifier(args.session_id, "session id")]
     if args.event_type:
-        entries = [entry for entry in entries if entry.event_type == validate_identifier(args.event_type, "event type")]
+        entries = [entry for entry in entries if entry.event_type == normalize_identifier(args.event_type, "event type")]
 
     if args.since:
         entries = [entry for entry in entries if entry.timestamp >= args.since]
@@ -735,7 +797,17 @@ def command_validate(args: argparse.Namespace) -> int:
     for index_path in index_paths:
         entries = load_index_entries(index_path)
         for entry in entries:
-            action_path = link_to_path(entry.action_link, root)
+            try:
+                action_path = link_to_path(entry.action_link, root)
+            except ValueError as exc:
+                issues.append(
+                    ValidationIssue(
+                        kind="unsafe_memory_link",
+                        path=index_path.as_posix(),
+                        detail=str(exc),
+                    )
+                )
+                continue
             referenced_actions.add(action_path)
             if not action_path.exists():
                 issues.append(
@@ -750,9 +822,19 @@ def command_validate(args: argparse.Namespace) -> int:
     for action_file in action_files:
         text = action_file.read_text(encoding="utf-8")
         for raw_link in extract_wiki_links(text):
+            try:
+                linked = link_to_path(f"[[{raw_link}]]", root)
+            except ValueError as exc:
+                issues.append(
+                    ValidationIssue(
+                        kind="unsafe_memory_link",
+                        path=action_file.as_posix(),
+                        detail=str(exc),
+                    )
+                )
+                continue
             if not raw_link.startswith("actions/"):
                 continue
-            linked = link_to_path(f"[[{raw_link}]]", root)
             if linked.suffix == ".raw":
                 referenced_raw.add(linked)
                 if not linked.exists():

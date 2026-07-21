@@ -828,6 +828,8 @@ def test_lock_contention_does_not_delete_healthy_index(tmp_path: Path) -> None:
     try:
         with pytest.raises(sqlite3.OperationalError):
             agent_memory.sync_memory_index(tmp_path)
+        with pytest.raises(sqlite3.OperationalError):
+            agent_memory.rebuild_memory_index(tmp_path)
         assert index_path.exists()
     finally:
         connection.rollback()
@@ -973,3 +975,59 @@ def test_status_and_sync_recover_fts_internal_corruption(tmp_path: Path) -> None
     repaired = agent_memory.sync_memory_index(tmp_path)
     assert repaired["recovered"] is True
     assert agent_memory.search_indexed_documents(tmp_path, "fts corruption")[0].memory_uuid == "fts-corrupt-id"
+
+
+def test_canonical_wal_sidecar_forces_safe_scan_fallback(tmp_path: Path) -> None:
+    write_action(tmp_path, memory_uuid="wal-id", message="canonical wal memory")
+    agent_memory.sync_memory_index(tmp_path)
+    connection = sqlite3.connect(agent_memory.memory_index_path(tmp_path))
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute(
+        "UPDATE documents SET message = 'stale wal payload' WHERE memory_uuid = 'wal-id'"
+    )
+    connection.commit()
+    try:
+        assert agent_memory.memory_index_status(tmp_path)["ok"] is False
+        with pytest.raises(ValueError, match="sidecar"):
+            agent_memory.search_indexed_documents(tmp_path, "canonical wal")
+        assert agent_memory.search_memories(tmp_path, "canonical wal", mode="auto")[0].memory_uuid == "wal-id"
+    finally:
+        connection.close()
+
+
+def test_auto_falls_back_if_sidecar_appears_after_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_action(tmp_path, memory_uuid="wal-race-id", message="wal race canonical")
+    agent_memory.sync_memory_index(tmp_path)
+    connection = sqlite3.connect(agent_memory.memory_index_path(tmp_path))
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("UPDATE documents SET message = 'stale' WHERE memory_uuid = 'wal-race-id'")
+    connection.commit()
+    monkeypatch.setattr(agent_memory, "memory_index_status", lambda root: {"ok": True})
+    try:
+        result = agent_memory.search_memories(tmp_path, "wal race canonical", mode="auto")
+        assert result[0].memory_uuid == "wal-race-id"
+    finally:
+        connection.close()
+
+
+def test_failed_post_replace_step_restores_corrupt_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_action(tmp_path, memory_uuid="restore-id", message="restore memory")
+    index_path = agent_memory.memory_index_path(tmp_path)
+    index_path.parent.mkdir(parents=True)
+    original = b"corrupt original bytes"
+    index_path.write_bytes(original)
+    real_fchmod = os.fchmod
+
+    def fail_regular_file(descriptor: int, mode: int) -> None:
+        if os.path.isfile(f"/proc/self/fd/{descriptor}"):
+            raise OSError("injected chmod failure")
+        real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(agent_memory.os, "fchmod", fail_regular_file)
+    with pytest.raises(OSError, match="injected chmod failure"):
+        agent_memory.sync_memory_index(tmp_path)
+    assert index_path.read_bytes() == original

@@ -580,6 +580,26 @@ def _validate_index_entry(directory_fd: int, name: str) -> os.stat_result | None
     return details
 
 
+def _reject_canonical_sidecars(directory_fd: int) -> None:
+    for name in ("search.sqlite3-wal", "search.sqlite3-shm", "search.sqlite3-journal"):
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise ValueError(f"canonical SQLite sidecar requires fallback or rebuild: {name}")
+
+
+def _is_sqlite_corruption(exc: BaseException) -> bool:
+    markers = (
+        "not a database",
+        "malformed",
+        "no such table",
+        "file is encrypted",
+        "schema migration required",
+    )
+    return any(marker in str(exc).lower() for marker in markers)
+
+
 def _stable_directory_path(directory_fd: int) -> Path:
     for base in (Path("/proc/self/fd"), Path("/dev/fd")):
         candidate = base / str(directory_fd)
@@ -596,9 +616,12 @@ def _remove_index_files(root: Path) -> None:
 
 
 @contextmanager
-def _connect_memory_index(root: Path, *, read_only: bool = False, create: bool = True):
+def _connect_memory_index(
+    root: Path, *, read_only: bool = False, create: bool = True, reset: bool = False
+):
     with _secure_index_directory(root) as directory_fd:
         original = _validate_index_entry(directory_fd, "search.sqlite3")
+        _reject_canonical_sidecars(directory_fd)
         if original is None and not create:
             raise FileNotFoundError(memory_index_path(root))
         temporary_name = f".search-{uuid.uuid4().hex}.sqlite3"
@@ -631,18 +654,38 @@ def _connect_memory_index(root: Path, *, read_only: bool = False, create: bool =
                     lock_details = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
                     if lock_details.st_ino != source_details.st_ino or lock_details.st_dev != source_details.st_dev:
                         raise ValueError("memory index changed while locking")
-                    lock_connection = sqlite3.connect(
-                        _stable_directory_path(directory_fd) / lock_name, timeout=0
-                    )
-                    lock_connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
-                    lock_connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
-                    while True:
-                        block = os.read(source_fd, 1024 * 1024)
-                        if not block:
-                            break
-                        os.write(temporary_fd, block)
+                    try:
+                        lock_connection = sqlite3.connect(
+                            _stable_directory_path(directory_fd) / lock_name, timeout=0
+                        )
+                        lock_connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
+                        lock_connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+                    except sqlite3.DatabaseError as exc:
+                        if not (reset and _is_sqlite_corruption(exc)):
+                            raise
+                        if lock_connection is not None:
+                            lock_connection.close()
+                            lock_connection = None
+                    if not reset:
+                        while True:
+                            block = os.read(source_fd, 1024 * 1024)
+                            if not block:
+                                break
+                            os.write(temporary_fd, block)
                 finally:
                     os.close(source_fd)
+                if not reset:
+                    _reject_canonical_sidecars(directory_fd)
+                    current_source = os.stat(
+                        "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        current_source.st_ino != original.st_ino
+                        or current_source.st_dev != original.st_dev
+                        or current_source.st_size != original.st_size
+                        or current_source.st_mtime_ns != original.st_mtime_ns
+                    ):
+                        raise ValueError("memory index changed while snapshotting")
             os.fsync(temporary_fd)
         except BaseException:
             if lock_connection is not None:
@@ -707,57 +750,93 @@ def _connect_memory_index(root: Path, *, read_only: bool = False, create: bool =
             successful = True
         finally:
             connection.close()
-            if successful and not read_only:
-                if lock_name:
-                    os.unlink(lock_name, dir_fd=directory_fd)
-                    lock_name = ""
-                current = _validate_index_entry(directory_fd, "search.sqlite3")
-                if original is None:
-                    if current is not None:
-                        raise ValueError("memory index appeared while updating")
-                elif current is None or current.st_ino != original.st_ino or current.st_dev != original.st_dev:
-                    raise ValueError("memory index changed while updating")
-                install_fd = os.open(
-                    temporary_name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=directory_fd,
-                )
-                try:
-                    install_details = os.fstat(install_fd)
-                    if (
-                        install_details.st_ino != temporary_identity.st_ino
-                        or install_details.st_dev != temporary_identity.st_dev
-                        or install_details.st_nlink != 1
-                        or install_details.st_uid != os.geteuid()
-                    ):
-                        raise ValueError("memory index snapshot changed before installation")
-                    os.replace(
-                        temporary_name,
-                        "search.sqlite3",
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
+            installation_error = None
+            try:
+                if successful and original is not None:
+                    _reject_canonical_sidecars(directory_fd)
+                    stable_current = os.stat(
+                        "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
                     )
-                    installed = os.stat("search.sqlite3", dir_fd=directory_fd, follow_symlinks=False)
-                    if installed.st_ino != install_details.st_ino or installed.st_dev != install_details.st_dev:
-                        raise ValueError("memory index snapshot changed during installation")
-                    os.fchmod(install_fd, 0o600)
-                finally:
-                    os.close(install_fd)
-                temporary_name = ""
-            if lock_connection is not None:
-                lock_connection.rollback()
-                lock_connection.close()
-            if temporary_name:
-                for suffix in ("", "-journal", "-wal", "-shm"):
+                    if (
+                        stable_current.st_ino != original.st_ino
+                        or stable_current.st_dev != original.st_dev
+                        or stable_current.st_size != original.st_size
+                        or stable_current.st_mtime_ns != original.st_mtime_ns
+                    ):
+                        raise ValueError("memory index changed during snapshot use")
+                if successful and not read_only:
+                    current = os.stat(
+                        "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                    ) if original is not None else _validate_index_entry(directory_fd, "search.sqlite3")
+                    if original is None:
+                        if current is not None:
+                            raise ValueError("memory index appeared while updating")
+                    elif current.st_ino != original.st_ino or current.st_dev != original.st_dev:
+                        raise ValueError("memory index changed while updating")
+                    install_fd = os.open(
+                        temporary_name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
                     try:
-                        os.unlink(f"{temporary_name}{suffix}", dir_fd=directory_fd)
+                        install_details = os.fstat(install_fd)
+                        if (
+                            install_details.st_ino != temporary_identity.st_ino
+                            or install_details.st_dev != temporary_identity.st_dev
+                            or install_details.st_nlink != 1
+                            or install_details.st_uid != os.geteuid()
+                        ):
+                            raise ValueError("memory index snapshot changed before installation")
+                        os.replace(
+                            temporary_name,
+                            "search.sqlite3",
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                        )
+                        try:
+                            installed = os.stat(
+                                "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                            )
+                            if (
+                                installed.st_ino != install_details.st_ino
+                                or installed.st_dev != install_details.st_dev
+                            ):
+                                raise ValueError("memory index snapshot changed during installation")
+                            os.fchmod(install_fd, 0o600)
+                        except BaseException:
+                            if original is not None and lock_name:
+                                os.replace(
+                                    lock_name,
+                                    "search.sqlite3",
+                                    src_dir_fd=directory_fd,
+                                    dst_dir_fd=directory_fd,
+                                )
+                                lock_name = ""
+                            elif original is None:
+                                os.unlink("search.sqlite3", dir_fd=directory_fd)
+                            raise
+                        temporary_name = ""
+                    finally:
+                        os.close(install_fd)
+            except BaseException as exc:
+                installation_error = exc
+            finally:
+                if lock_connection is not None:
+                    lock_connection.rollback()
+                    lock_connection.close()
+                if temporary_name:
+                    for suffix in ("", "-journal", "-wal", "-shm"):
+                        try:
+                            os.unlink(f"{temporary_name}{suffix}", dir_fd=directory_fd)
+                        except FileNotFoundError:
+                            pass
+                if lock_name:
+                    try:
+                        os.unlink(lock_name, dir_fd=directory_fd)
                     except FileNotFoundError:
                         pass
-            if lock_name:
-                try:
-                    os.unlink(lock_name, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
+            if installation_error is not None:
+                raise installation_error
 
 
 def _discover_index_documents(root: Path) -> list[tuple[ActionDocument, str]]:
@@ -813,9 +892,9 @@ def _check_fts_integrity(connection: sqlite3.Connection) -> None:
     )
 
 
-def _sync_memory_index_once(root: Path) -> dict:
+def _sync_memory_index_once(root: Path, *, reset: bool = False) -> dict:
     documents = _discover_index_documents(root)
-    with _connect_memory_index(root) as connection:
+    with _connect_memory_index(root, reset=reset) as connection:
         _check_fts_integrity(connection)
         existing = {
             row[0]: tuple(row[1:])
@@ -906,19 +985,16 @@ def sync_memory_index(root: Path) -> dict:
     try:
         return _sync_memory_index_once(root)
     except sqlite3.DatabaseError as exc:
-        corruption_markers = ("not a database", "malformed", "no such table", "file is encrypted")
-        if not any(marker in str(exc).lower() for marker in corruption_markers):
+        if not _is_sqlite_corruption(exc):
             raise
-        _remove_index_files(root)
-        result = _sync_memory_index_once(root)
+        result = _sync_memory_index_once(root, reset=True)
         result["recovered"] = True
         return result
 
 
 def rebuild_memory_index(root: Path) -> dict:
     root = root.expanduser().resolve()
-    _remove_index_files(root)
-    return _sync_memory_index_once(root)
+    return _sync_memory_index_once(root, reset=True)
 
 
 def memory_index_status(root: Path) -> dict:
@@ -1101,7 +1177,7 @@ def search_memories(root: Path, query: str, *, mode: str = "auto", **filters) ->
         try:
             sync_memory_index(root)
             return search_indexed_documents(root, query, **filters)
-        except (OSError, sqlite3.DatabaseError):
+        except (OSError, sqlite3.DatabaseError, ValueError):
             pass
     return search_action_documents(root, query, **filters)
 

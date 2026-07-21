@@ -56,6 +56,20 @@ python3 agent_memory.py load --root ~/opencode --source master --limit 20 --reve
 python3 agent_memory.py load --root ~/opencode --source session --session-id ses_example --format json
 ```
 
+Search canonical action memories without indexing raw tool artifacts:
+
+```bash
+memlog search "routing decision" --root ~/opencode --limit 10
+memlog search "routing decision" --root ~/opencode \
+  --agent-id pr.command.zordon --since 2026-07-01T00:00:00Z --format json
+```
+
+Search is deliberately local and deterministic. Every query term must occur
+in one canonical field (`title`, `summary`, or `full message`). Results include
+the memory UUID, source path, matched field, snippet, and score. Raw artifacts,
+symlinks, malformed action documents, and paths outside the memory root are
+never searched.
+
 Validate links and orphan raw artifacts:
 
 ```bash
@@ -71,7 +85,7 @@ python3 agent_memory.py doctor --root ~/opencode
 ## Structure under `--root`
 
 - `memory/master.md`
-- `memory/agents/{agent_name}.md`
+- `memory/agents/{agent_id}.md`
 - `memory/sessions/{session_id}.md`
 - `actions/{Y}/{m}/{His.millisecond}-{memory_uuid}.md`
 - `actions/{Y}/{m}/raw/{His.millisecond}-{memory_uuid}.raw`
@@ -98,3 +112,33 @@ The logger redacts likely secrets before write:
 - API keys/tokens/secrets/password key-value patterns
 - private key blocks
 - high-entropy token-like strings
+
+Identifiers used in paths are validated rather than normalized. Empty values,
+`.`/`..`, separators, control characters, and unsupported characters are
+rejected. Wiki links are resolved beneath the configured memory root before
+they may be read.
+
+## Retrieval roadmap
+
+Markdown action documents remain authoritative. Search databases, embeddings,
+profiles, and graph scores are disposable projections that must be rebuildable
+from those documents.
+
+Planned incremental layers are:
+
+1. SQLite FTS5 catalog with direct-scan fallback.
+2. Explicitly configured local embeddings and hybrid retrieval.
+3. Provenance-backed profile candidates requiring approval before injection.
+4. Opt-in, token-budgeted context construction that quotes memories as
+   untrusted data.
+5. Explicit project registry for cross-project recall.
+6. Bounded PageRank-like importance over canonical memory links.
+7. Optional Redis, OpenSearch, or MariaDB adapters for multi-host scale; none
+   becomes authoritative and none is contacted implicitly.
+
+Run the tests with:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest -q
+```

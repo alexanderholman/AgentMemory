@@ -2,14 +2,17 @@
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +23,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 DEFAULT_ROOT = Path.home() / "opencode"
+MEMORY_INDEX_SCHEMA_VERSION = 2
 SENSITIVE_PATTERNS = [
     re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._\-]+"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[A-Za-z0-9._\-]+"),
@@ -520,6 +524,664 @@ def search_action_documents(
     return results[:limit]
 
 
+def memory_index_path(root: Path) -> Path:
+    return root.expanduser().resolve() / "memory" / ".state" / "search.sqlite3"
+
+
+@contextmanager
+def _secure_index_directory(root: Path):
+    root = root.expanduser().resolve()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_descriptor = os.open(root, flags)
+    memory_descriptor = None
+    state_descriptor = None
+    try:
+        for parent_descriptor, name in ((root_descriptor, "memory"),):
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+        try:
+            memory_descriptor = os.open("memory", flags, dir_fd=root_descriptor)
+        except (NotADirectoryError, OSError) as exc:
+            raise ValueError("refusing symlinked memory index directory: memory") from exc
+        try:
+            os.mkdir(".state", 0o700, dir_fd=memory_descriptor)
+        except FileExistsError:
+            pass
+        try:
+            state_descriptor = os.open(".state", flags, dir_fd=memory_descriptor)
+        except (NotADirectoryError, OSError) as exc:
+            raise ValueError("refusing symlinked memory index directory: .state") from exc
+        details = os.fstat(state_descriptor)
+        if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.geteuid():
+            raise ValueError("memory index directory is not private and owned")
+        os.fchmod(state_descriptor, 0o700)
+        yield state_descriptor
+    finally:
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+        if memory_descriptor is not None:
+            os.close(memory_descriptor)
+        os.close(root_descriptor)
+
+
+def _validate_index_entry(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError(f"memory index is not a regular file: {name}")
+    if details.st_nlink != 1:
+        raise ValueError(f"refusing hardlinked memory index file: {name}")
+    if details.st_uid != os.geteuid():
+        raise ValueError(f"memory index has unexpected owner: {name}")
+    return details
+
+
+def _reject_canonical_sidecars(directory_fd: int) -> None:
+    for name in ("search.sqlite3-wal", "search.sqlite3-shm", "search.sqlite3-journal"):
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise ValueError(f"canonical SQLite sidecar requires fallback or rebuild: {name}")
+
+
+def _is_sqlite_corruption(exc: BaseException) -> bool:
+    markers = (
+        "not a database",
+        "malformed",
+        "no such table",
+        "file is encrypted",
+        "schema migration required",
+    )
+    return any(marker in str(exc).lower() for marker in markers)
+
+
+def _stable_directory_path(directory_fd: int) -> Path:
+    for base in (Path("/proc/self/fd"), Path("/dev/fd")):
+        candidate = base / str(directory_fd)
+        if candidate.exists():
+            return candidate
+    raise RuntimeError("stable file-descriptor paths are unavailable")
+
+
+def _remove_index_files(root: Path) -> None:
+    with _secure_index_directory(root) as directory_fd:
+        for name in ("search.sqlite3", "search.sqlite3-wal", "search.sqlite3-shm"):
+            if _validate_index_entry(directory_fd, name) is not None:
+                os.unlink(name, dir_fd=directory_fd)
+
+
+@contextmanager
+def _connect_memory_index(
+    root: Path, *, read_only: bool = False, create: bool = True, reset: bool = False
+):
+    with _secure_index_directory(root) as directory_fd:
+        original = _validate_index_entry(directory_fd, "search.sqlite3")
+        _reject_canonical_sidecars(directory_fd)
+        if original is None and not create:
+            raise FileNotFoundError(memory_index_path(root))
+        temporary_name = f".search-{uuid.uuid4().hex}.sqlite3"
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        temporary_identity = os.fstat(temporary_fd)
+        lock_name = ""
+        lock_connection = None
+        try:
+            if original is not None:
+                source_fd = os.open(
+                    "search.sqlite3", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd
+                )
+                try:
+                    source_details = os.fstat(source_fd)
+                    if source_details.st_ino != original.st_ino or source_details.st_dev != original.st_dev:
+                        raise ValueError("memory index changed while snapshotting")
+                    lock_name = f".search-lock-{uuid.uuid4().hex}.sqlite3"
+                    os.link(
+                        "search.sqlite3",
+                        lock_name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    lock_details = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
+                    if lock_details.st_ino != source_details.st_ino or lock_details.st_dev != source_details.st_dev:
+                        raise ValueError("memory index changed while locking")
+                    try:
+                        lock_connection = sqlite3.connect(
+                            _stable_directory_path(directory_fd) / lock_name, timeout=0
+                        )
+                        lock_connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
+                        lock_connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+                    except sqlite3.DatabaseError as exc:
+                        if not (reset and _is_sqlite_corruption(exc)):
+                            raise
+                        if lock_connection is not None:
+                            lock_connection.close()
+                            lock_connection = None
+                    if not reset:
+                        while True:
+                            block = os.read(source_fd, 1024 * 1024)
+                            if not block:
+                                break
+                            os.write(temporary_fd, block)
+                finally:
+                    os.close(source_fd)
+                if not reset:
+                    _reject_canonical_sidecars(directory_fd)
+                    current_source = os.stat(
+                        "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        current_source.st_ino != original.st_ino
+                        or current_source.st_dev != original.st_dev
+                        or current_source.st_size != original.st_size
+                        or current_source.st_mtime_ns != original.st_mtime_ns
+                    ):
+                        raise ValueError("memory index changed while snapshotting")
+            os.fsync(temporary_fd)
+        except BaseException:
+            if lock_connection is not None:
+                lock_connection.rollback()
+                lock_connection.close()
+            if lock_name:
+                try:
+                    os.unlink(lock_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            os.close(temporary_fd)
+        stable_path = _stable_directory_path(directory_fd) / temporary_name
+        connection = sqlite3.connect(stable_path, timeout=0)
+        successful = False
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = DELETE")
+            if not read_only:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS index_meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS documents (
+                        memory_uuid TEXT PRIMARY KEY,
+                        relative_path TEXT NOT NULL UNIQUE,
+                        content_hash TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        agent TEXT NOT NULL,
+                        session TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        row_hash TEXT NOT NULL
+                    );
+                    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+                        memory_uuid UNINDEXED,
+                        title,
+                        summary,
+                        message,
+                        tokenize = 'unicode61'
+                    );
+                    """
+                )
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+                if "row_hash" not in columns:
+                    raise sqlite3.DatabaseError("schema migration required")
+                connection.execute(
+                    "INSERT OR REPLACE INTO index_meta(key, value) VALUES('schema_version', ?)",
+                    (str(MEMORY_INDEX_SCHEMA_VERSION),),
+                )
+                connection.commit()
+            yield connection
+            successful = True
+        finally:
+            connection.close()
+            installation_error = None
+            try:
+                if successful and original is not None:
+                    _reject_canonical_sidecars(directory_fd)
+                    stable_current = os.stat(
+                        "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        stable_current.st_ino != original.st_ino
+                        or stable_current.st_dev != original.st_dev
+                        or stable_current.st_size != original.st_size
+                        or stable_current.st_mtime_ns != original.st_mtime_ns
+                    ):
+                        raise ValueError("memory index changed during snapshot use")
+                if successful and not read_only:
+                    current = os.stat(
+                        "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                    ) if original is not None else _validate_index_entry(directory_fd, "search.sqlite3")
+                    if original is None:
+                        if current is not None:
+                            raise ValueError("memory index appeared while updating")
+                    elif current.st_ino != original.st_ino or current.st_dev != original.st_dev:
+                        raise ValueError("memory index changed while updating")
+                    install_fd = os.open(
+                        temporary_name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        install_details = os.fstat(install_fd)
+                        if (
+                            install_details.st_ino != temporary_identity.st_ino
+                            or install_details.st_dev != temporary_identity.st_dev
+                            or install_details.st_nlink != 1
+                            or install_details.st_uid != os.geteuid()
+                        ):
+                            raise ValueError("memory index snapshot changed before installation")
+                        os.replace(
+                            temporary_name,
+                            "search.sqlite3",
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                        )
+                        try:
+                            installed = os.stat(
+                                "search.sqlite3", dir_fd=directory_fd, follow_symlinks=False
+                            )
+                            if (
+                                installed.st_ino != install_details.st_ino
+                                or installed.st_dev != install_details.st_dev
+                            ):
+                                raise ValueError("memory index snapshot changed during installation")
+                            os.fchmod(install_fd, 0o600)
+                        except BaseException:
+                            if original is not None and lock_name:
+                                os.replace(
+                                    lock_name,
+                                    "search.sqlite3",
+                                    src_dir_fd=directory_fd,
+                                    dst_dir_fd=directory_fd,
+                                )
+                                lock_name = ""
+                            elif original is None:
+                                os.unlink("search.sqlite3", dir_fd=directory_fd)
+                            raise
+                        temporary_name = ""
+                    finally:
+                        os.close(install_fd)
+            except BaseException as exc:
+                installation_error = exc
+            finally:
+                if lock_connection is not None:
+                    lock_connection.rollback()
+                    lock_connection.close()
+                if temporary_name:
+                    for suffix in ("", "-journal", "-wal", "-shm"):
+                        try:
+                            os.unlink(f"{temporary_name}{suffix}", dir_fd=directory_fd)
+                        except FileNotFoundError:
+                            pass
+                if lock_name:
+                    try:
+                        os.unlink(lock_name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+            if installation_error is not None:
+                raise installation_error
+
+
+def _discover_index_documents(root: Path) -> list[tuple[ActionDocument, str]]:
+    root = root.expanduser().resolve()
+    action_root = root / "actions"
+    if not action_root.is_dir() or action_root.is_symlink():
+        return []
+    documents: list[tuple[ActionDocument, str]] = []
+    seen_uuids: set[str] = set()
+    scanned_files = 0
+    scanned_bytes = 0
+    scanned_directories = 0
+    for current_dir, dirs, files in os.walk(action_root, followlinks=False):
+        scanned_directories += 1
+        if scanned_directories > 10_000:
+            raise ValueError("index scan exceeds configured resource limits")
+        dirs[:] = sorted(name for name in dirs if name != "raw")
+        for filename in sorted(files):
+            if not filename.endswith(".md"):
+                continue
+            scanned_files += 1
+            path = Path(current_dir) / filename
+            try:
+                scanned_bytes += min(path.lstat().st_size, 1_000_001)
+            except OSError:
+                pass
+            if scanned_files > 10_000 or scanned_bytes > 50_000_000:
+                raise ValueError("index scan exceeds configured resource limits")
+            try:
+                document = parse_action_document(path, root)
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if document.memory_uuid in seen_uuids:
+                raise ValueError(f"duplicate memory UUID: {document.memory_uuid}")
+            seen_uuids.add(document.memory_uuid)
+            content_hash = hashlib.sha256(document.source_text.encode("utf-8")).hexdigest()
+            documents.append((document, content_hash))
+    return documents
+
+
+def _indexed_row_hash(values: tuple[str, ...]) -> str:
+    encoded = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _fts_text(value: str) -> str:
+    return " ".join(re.findall(r"\w+", value.casefold(), flags=re.UNICODE))
+
+
+def _check_fts_integrity(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT INTO documents_fts(documents_fts) VALUES('integrity-check')"
+    )
+
+
+def _sync_memory_index_once(root: Path, *, reset: bool = False) -> dict:
+    documents = _discover_index_documents(root)
+    with _connect_memory_index(root, reset=reset) as connection:
+        _check_fts_integrity(connection)
+        existing = {
+            row[0]: tuple(row[1:])
+            for row in connection.execute(
+                """
+                SELECT d.memory_uuid, d.content_hash, d.relative_path, d.timestamp,
+                       d.agent, d.session, d.event_type, d.title, d.summary, d.message,
+                       d.row_hash, COUNT(f.rowid), MIN(f.title), MIN(f.summary), MIN(f.message)
+                FROM documents AS d
+                LEFT JOIN documents_fts AS f ON f.memory_uuid = d.memory_uuid
+                GROUP BY d.memory_uuid
+                """
+            )
+        }
+        added = updated = unchanged = 0
+        seen: set[str] = set()
+        for document, content_hash in documents:
+            seen.add(document.memory_uuid)
+            prior = existing.get(document.memory_uuid)
+            title, _ = redact_text(document.title)
+            summary, _ = redact_text(document.summary)
+            message, _ = redact_text(document.message)
+            row_values = (
+                content_hash,
+                document.relative_path,
+                document.timestamp,
+                document.agent,
+                document.session,
+                document.event_type,
+                title,
+                summary,
+                message,
+            )
+            row_hash = _indexed_row_hash(row_values)
+            expected_fts = (_fts_text(title), _fts_text(summary), _fts_text(message))
+            if prior == (*row_values, row_hash, 1, *expected_fts):
+                unchanged += 1
+                continue
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO documents(
+                    memory_uuid, relative_path, content_hash, timestamp, agent, session,
+                    event_type, title, summary, message, row_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document.memory_uuid,
+                    document.relative_path,
+                    content_hash,
+                    document.timestamp,
+                    document.agent,
+                    document.session,
+                    document.event_type,
+                    title,
+                    summary,
+                    message,
+                    row_hash,
+                ),
+            )
+            connection.execute("DELETE FROM documents_fts WHERE memory_uuid = ?", (document.memory_uuid,))
+            connection.execute(
+                "INSERT INTO documents_fts(memory_uuid, title, summary, message) VALUES (?, ?, ?, ?)",
+                (document.memory_uuid, *expected_fts),
+            )
+            if prior is None:
+                added += 1
+            else:
+                updated += 1
+        removed_uuids = sorted(set(existing) - seen)
+        for memory_uuid in removed_uuids:
+            connection.execute("DELETE FROM documents WHERE memory_uuid = ?", (memory_uuid,))
+            connection.execute("DELETE FROM documents_fts WHERE memory_uuid = ?", (memory_uuid,))
+        connection.execute(
+            "DELETE FROM documents_fts WHERE memory_uuid NOT IN (SELECT memory_uuid FROM documents)"
+        )
+        connection.commit()
+    return {
+        "added": added,
+        "updated": updated,
+        "removed": len(removed_uuids),
+        "unchanged": unchanged,
+        "recovered": False,
+    }
+
+
+def sync_memory_index(root: Path) -> dict:
+    root = root.expanduser().resolve()
+    try:
+        return _sync_memory_index_once(root)
+    except sqlite3.DatabaseError as exc:
+        if not _is_sqlite_corruption(exc):
+            raise
+        result = _sync_memory_index_once(root, reset=True)
+        result["recovered"] = True
+        return result
+
+
+def rebuild_memory_index(root: Path) -> dict:
+    root = root.expanduser().resolve()
+    return _sync_memory_index_once(root, reset=True)
+
+
+def memory_index_status(root: Path) -> dict:
+    path = memory_index_path(root)
+    try:
+        with _connect_memory_index(root, read_only=True, create=False) as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            _check_fts_integrity(connection)
+            schema_row = connection.execute(
+                "SELECT value FROM index_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            count = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            fts_count = connection.execute("SELECT COUNT(*) FROM documents_fts").fetchone()[0]
+            missing_fts = connection.execute(
+                """
+                SELECT COUNT(*) FROM documents AS d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM documents_fts AS f WHERE f.memory_uuid = d.memory_uuid
+                )
+                """
+            ).fetchone()[0]
+            orphan_fts = connection.execute(
+                """
+                SELECT COUNT(*) FROM documents_fts AS f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM documents AS d WHERE d.memory_uuid = f.memory_uuid
+                )
+                """
+            ).fetchone()[0]
+            payload_rows = connection.execute(
+                """
+                SELECT d.title, d.summary, d.message, f.title, f.summary, f.message
+                FROM documents AS d
+                JOIN documents_fts AS f ON f.memory_uuid = d.memory_uuid
+                """
+            ).fetchall()
+            payload_ok = all(
+                (_fts_text(row[0]), _fts_text(row[1]), _fts_text(row[2])) == tuple(row[3:])
+                for row in payload_rows
+            )
+            document_rows = connection.execute(
+                """
+                SELECT content_hash, relative_path, timestamp, agent, session, event_type,
+                       title, summary, message, row_hash
+                FROM documents
+                """
+            ).fetchall()
+            document_rows_ok = all(
+                _indexed_row_hash(tuple(row[:9])) == row[9] for row in document_rows
+            )
+        schema_version = int(schema_row[0]) if schema_row else None
+        return {
+            "ok": (
+                integrity == "ok"
+                and schema_version == MEMORY_INDEX_SCHEMA_VERSION
+                and fts_count == count
+                and missing_fts == 0
+                and orphan_fts == 0
+                and payload_ok
+                and document_rows_ok
+            ),
+            "exists": True,
+            "schema_version": schema_version,
+            "document_count": count,
+            "path": path.as_posix(),
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "exists": False,
+            "schema_version": None,
+            "document_count": 0,
+            "path": path.as_posix(),
+        }
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return {
+            "ok": False,
+            "exists": True,
+            "schema_version": None,
+            "document_count": 0,
+            "path": path.as_posix(),
+        }
+
+
+def search_indexed_documents(
+    root: Path,
+    query: str,
+    *,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+) -> list[SearchResult]:
+    terms = _query_terms(query)
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    if agent_id:
+        agent_id = validate_identifier(agent_id, "agent id")
+    if session_id:
+        session_id = validate_identifier(session_id, "session id")
+    if event_type:
+        event_type = validate_identifier(event_type, "event type")
+    since_value = parse_timestamp(since, "since timestamp") if since else None
+    until_value = parse_timestamp(until, "until timestamp") if until else None
+    if since_value and until_value and since_value > until_value:
+        raise ValueError("since timestamp must not be after until timestamp")
+    fts_query = " AND ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+    use_fts = all(term.isascii() and term.isalnum() for term in terms)
+    clauses = []
+    parameters: list[str] = []
+    if use_fts:
+        clauses.append("documents_fts MATCH ?")
+        parameters.append(fts_query)
+    for column, value in (("d.agent", agent_id), ("d.session", session_id), ("d.event_type", event_type)):
+        if value:
+            clauses.append(f"{column} = ?")
+            parameters.append(value)
+    with _connect_memory_index(root, read_only=True, create=False) as connection:
+        source = "documents_fts JOIN documents AS d USING(memory_uuid)" if use_fts else "documents AS d"
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = connection.execute(
+            f"""
+            SELECT d.timestamp, d.memory_uuid, d.agent, d.session, d.event_type,
+                   d.relative_path, d.title, d.summary, d.message
+            FROM {source}
+            {where_clause}
+            """,
+            parameters,
+        ).fetchall()
+    field_order = {"title": 0, "summary": 1, "message": 2}
+    results: list[SearchResult] = []
+    for timestamp, memory_uuid, agent, session, kind, relative_path, title, summary, message in rows:
+        if agent_id and agent != agent_id:
+            continue
+        if session_id and session != session_id:
+            continue
+        if event_type and kind != event_type:
+            continue
+        timestamp_value = parse_timestamp(timestamp)
+        if since_value and timestamp_value < since_value:
+            continue
+        if until_value and timestamp_value > until_value:
+            continue
+        candidates = []
+        for field, content in (("title", title), ("summary", summary), ("message", message)):
+            score = _matching_score(content, terms)
+            if score:
+                candidates.append((score, field_order[field], field, single_line_text(content)))
+        if not candidates:
+            continue
+        score, _, matched_field, snippet = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
+        results.append(
+            SearchResult(
+                timestamp=timestamp,
+                memory_uuid=memory_uuid,
+                agent=agent,
+                session=session,
+                event_type=kind,
+                relative_path=relative_path,
+                matched_field=matched_field,
+                snippet=snippet,
+                score=score,
+            )
+        )
+    results.sort(key=lambda item: (parse_timestamp(item.timestamp), item.memory_uuid), reverse=True)
+    results.sort(key=lambda item: (-item.score, field_order[item.matched_field]))
+    return results[:limit]
+
+
+def search_memories(root: Path, query: str, *, mode: str = "auto", **filters) -> list[SearchResult]:
+    if mode not in {"auto", "index", "scan"}:
+        raise ValueError("search mode must be auto, index, or scan")
+    if mode == "scan":
+        return search_action_documents(root, query, **filters)
+    if mode == "index":
+        return search_indexed_documents(root, query, **filters)
+    if memory_index_status(root)["ok"]:
+        try:
+            sync_memory_index(root)
+            return search_indexed_documents(root, query, **filters)
+        except (OSError, sqlite3.DatabaseError, ValueError):
+            pass
+    return search_action_documents(root, query, **filters)
+
+
 def parse_message(args: argparse.Namespace) -> str:
     if args.message_file:
         return Path(args.message_file).read_text(encoding="utf-8")
@@ -848,9 +1510,10 @@ def command_load(args: argparse.Namespace) -> int:
 
 
 def command_search(args: argparse.Namespace) -> int:
-    results = search_action_documents(
+    results = search_memories(
         Path(args.root),
         args.query,
+        mode=args.mode,
         agent_id=args.agent_id,
         session_id=args.session_id,
         event_type=args.event_type,
@@ -868,6 +1531,23 @@ def command_search(args: argparse.Namespace) -> int:
             f"{result.agent} | {result.session} | {result.event_type} | "
             f"{safe_path} | {result.matched_field} | {result.snippet}"
         )
+    return 0
+
+
+def command_index(args: argparse.Namespace) -> int:
+    root = Path(args.root)
+    if args.index_command == "sync":
+        payload = sync_memory_index(root)
+    elif args.index_command == "rebuild":
+        payload = rebuild_memory_index(root)
+    else:
+        payload = memory_index_status(root)
+    if args.format == "json":
+        print(json.dumps(payload, indent=2))
+    else:
+        print(" | ".join(f"{key}: {value}" for key, value in payload.items()))
+    if args.index_command == "status" and not payload["ok"]:
+        return 1
     return 0
 
 
@@ -1124,8 +1804,17 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--since", help="ISO timestamp lower bound")
     search_parser.add_argument("--until", help="ISO timestamp upper bound")
     search_parser.add_argument("--limit", type=int, default=50)
+    search_parser.add_argument("--mode", choices=["auto", "index", "scan"], default="auto")
     search_parser.add_argument("--format", choices=["text", "json"], default="text")
     search_parser.set_defaults(func=command_search)
+
+    index_parser = subparsers.add_parser("index", help="manage the disposable SQLite search index")
+    index_subparsers = index_parser.add_subparsers(dest="index_command", required=True)
+    for index_command in ("sync", "status", "rebuild"):
+        child = index_subparsers.add_parser(index_command)
+        child.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")
+        child.add_argument("--format", choices=["text", "json"], default="text")
+        child.set_defaults(func=command_index)
 
     validate_parser = subparsers.add_parser("validate", help="validate links and raw artifacts")
     validate_parser.add_argument("--root", default=str(DEFAULT_ROOT), help="workspace root")

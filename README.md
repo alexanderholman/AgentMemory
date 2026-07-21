@@ -62,6 +62,7 @@ Search canonical action memories without indexing raw tool artifacts:
 memlog search "routing decision" --root ~/opencode --limit 10
 memlog search "routing decision" --root ~/opencode \
   --agent-id pr.command.zordon --since 2026-07-01T00:00:00Z --format json
+memlog search "routing decision" --root ~/opencode --mode index
 ```
 
 Search is deliberately local and deterministic. Every query term must occur
@@ -69,6 +70,35 @@ in one canonical field (`title`, `summary`, or `full message`). Results include
 the memory UUID, source path, matched field, snippet, and score. Raw artifacts,
 symlinks, malformed action documents, and paths outside the memory root are
 never searched.
+
+### Disposable SQLite index
+
+Build or refresh the local FTS5 projection:
+
+```bash
+memlog index sync --root ~/opencode
+memlog index status --root ~/opencode --format json
+memlog index rebuild --root ~/opencode
+```
+
+The index lives at `memory/.state/search.sqlite3`, is mode `0600`, and is
+derived entirely from canonical action Markdown. Synchronization is
+incremental by content hash and removes deleted documents. Status checks both
+SQLite integrity and correspondence between relational and FTS rows.
+
+Search modes are:
+
+- `auto` (default): use a healthy index after synchronizing it, otherwise scan
+  canonical Markdown directly;
+- `index`: require the SQLite index and fail if it is unavailable;
+- `scan`: bypass SQLite and use the deterministic Markdown fallback.
+
+Corrupt indexes are rebuilt only for recognized corruption errors. Lock
+contention is never treated as corruption, and symlinked or hardlinked index
+paths are rejected. SQLite operates on verified private snapshots and installs
+updates atomically; failed installation restores the prior inode. Canonical
+WAL, shared-memory, or hot-journal sidecars force `auto` mode to use the
+Markdown scan rather than risk stale indexed results.
 
 Validate links and orphan raw artifacts:
 
@@ -126,7 +156,7 @@ from those documents.
 
 Planned incremental layers are:
 
-1. SQLite FTS5 catalog with direct-scan fallback.
+1. ~~SQLite FTS5 catalog with direct-scan fallback.~~
 2. Explicitly configured local embeddings and hybrid retrieval.
 3. Provenance-backed profile candidates requiring approval before injection.
 4. Opt-in, token-budgeted context construction that quotes memories as

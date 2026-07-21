@@ -196,6 +196,228 @@ def test_search_cli_outputs_json(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert payload[0]["matched_field"] == "message"
 
 
+def test_search_parser_separates_text_backend_from_retrieval_mode() -> None:
+    parser = agent_memory.build_parser()
+
+    default_args = parser.parse_args(["search", "memory"])
+    semantic_args = parser.parse_args(
+        [
+            "search",
+            "memory",
+            "--mode",
+            "scan",
+            "--retrieval",
+            "semantic",
+            "--ollama-endpoint",
+            "http://127.0.0.1:11434",
+            "--ollama-model",
+            "model",
+            "--embedding-cache",
+            "local-private",
+        ]
+    )
+
+    assert (default_args.mode, default_args.retrieval) == ("auto", "text")
+    assert semantic_args.mode == "scan"
+    assert semantic_args.retrieval == "semantic"
+    assert semantic_args.embedding_cache == "local-private"
+
+
+def _cli_search_result(memory_uuid: str, score: float = 1.0) -> agent_memory.SearchResult:
+    return agent_memory.SearchResult(
+        timestamp="2026-07-21T12:00:00Z",
+        memory_uuid=memory_uuid,
+        agent="agent",
+        session="session",
+        event_type="message",
+        relative_path=f"actions/{memory_uuid}.md",
+        matched_field="semantic",
+        snippet=memory_uuid,
+        score=score,
+    )
+
+
+def _cli_fingerprint() -> agent_memory.ProviderFingerprint:
+    return agent_memory.ProviderFingerprint(
+        provider="ollama",
+        endpoint="http://127.0.0.1:11434",
+        model="model",
+        model_digest="sha256:model",
+        server_version="1.0",
+        document_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunker_version="canonical-fields-v1",
+    )
+
+
+def _semantic_cli_args(parser, tmp_path: Path, retrieval: str = "semantic", format: str = "json"):
+    return parser.parse_args(
+        [
+            "search",
+            "memory",
+            "--root",
+            str(tmp_path),
+            "--retrieval",
+            retrieval,
+            "--ollama-endpoint",
+            "http://127.0.0.1:11434",
+            "--ollama-model",
+            "model",
+            "--embedding-cache",
+            "local-private",
+            "--format",
+            format,
+        ]
+    )
+
+
+def test_semantic_cli_requires_all_explicit_provider_and_cache_options(tmp_path: Path) -> None:
+    args = agent_memory.build_parser().parse_args(
+        ["search", "memory", "--root", str(tmp_path), "--retrieval", "semantic"]
+    )
+
+    with pytest.raises(ValueError, match="^semantic_configuration_required$"):
+        args.func(args)
+
+
+def test_semantic_cli_syncs_and_returns_typed_json_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fingerprint = _cli_fingerprint()
+    calls = []
+    monkeypatch.setattr(agent_memory, "discover_ollama_fingerprint", lambda config, **kwargs: fingerprint)
+    monkeypatch.setattr(
+        agent_memory,
+        "sync_memory_embeddings",
+        lambda root, identity, embed, **kwargs: calls.append((root, identity, kwargs)),
+    )
+    monkeypatch.setattr(
+        agent_memory,
+        "search_semantic_documents",
+        lambda root, query, identity, embed, **kwargs: [_cli_search_result("semantic-id")],
+    )
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path)
+
+    assert args.func(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "requested_mode": "semantic",
+        "effective_mode": "semantic",
+        "degraded": False,
+        "reason_code": None,
+        "provider_fingerprint": fingerprint.digest(),
+        "results": [_cli_search_result("semantic-id").as_dict()],
+    }
+    assert calls[0][1] == fingerprint
+    assert calls[0][2] == {"acceptance_scope": OPERATOR_SCOPE, "cache_policy": LOCAL_CACHE}
+
+
+def test_hybrid_cli_fuses_deep_lexical_and_semantic_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fingerprint = _cli_fingerprint()
+    limits = []
+    monkeypatch.setattr(agent_memory, "discover_ollama_fingerprint", lambda config, **kwargs: fingerprint)
+    monkeypatch.setattr(agent_memory, "sync_memory_embeddings", lambda *args, **kwargs: None)
+
+    def semantic(*args, **kwargs):
+        limits.append(kwargs["limit"])
+        return [
+            *[_cli_search_result(f"semantic-{index}") for index in range(50)],
+            _cli_search_result("shared"),
+        ]
+
+    def lexical(*args, **kwargs):
+        limits.append(kwargs["limit"])
+        return [
+            *[_cli_search_result(f"text-{index}") for index in range(50)],
+            _cli_search_result("shared"),
+        ]
+
+    monkeypatch.setattr(agent_memory, "search_semantic_documents", semantic)
+    monkeypatch.setattr(agent_memory, "search_memories", lexical)
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval="hybrid")
+    args.limit = 1
+
+    assert args.func(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effective_mode"] == "hybrid"
+    assert payload["results"][0]["memory_uuid"] == "shared"
+    assert payload["results"][0]["matched_field"] == "hybrid"
+    assert limits == [62, 62]
+
+
+def test_hybrid_cli_rejects_limit_beyond_safe_two_ranking_bound(tmp_path: Path) -> None:
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval="hybrid")
+    args.limit = 471
+
+    with pytest.raises(ValueError, match="^hybrid_limit_exceeds_safe_bound$"):
+        args.func(args)
+
+
+def test_hybrid_fallback_does_not_mask_programming_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        agent_memory,
+        "discover_ollama_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TypeError("programming defect")),
+    )
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval="hybrid")
+    args.allow_hybrid_text_fallback = True
+
+    with pytest.raises(TypeError, match="programming defect"):
+        args.func(args)
+
+
+@pytest.mark.parametrize("retrieval", ["semantic", "hybrid"])
+def test_model_retrieval_fails_closed_with_sanitized_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retrieval: str,
+) -> None:
+    monkeypatch.setattr(
+        agent_memory,
+        "discover_ollama_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("secret provider payload")),
+    )
+    monkeypatch.setattr(
+        agent_memory,
+        "search_memories",
+        lambda *args, **kwargs: pytest.fail("must not silently return text results"),
+    )
+    args = _semantic_cli_args(agent_memory.build_parser(), tmp_path, retrieval=retrieval)
+
+    with pytest.raises(ValueError, match="^semantic_provider_failure$"):
+        args.func(args)
+    assert capsys.readouterr().out == ""
+
+
+def test_hybrid_explicit_fallback_returns_visible_degradation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        agent_memory,
+        "discover_ollama_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("private failure detail")),
+    )
+    monkeypatch.setattr(
+        agent_memory,
+        "search_memories",
+        lambda *args, **kwargs: [_cli_search_result("text-id")],
+    )
+    parser = agent_memory.build_parser()
+    args = _semantic_cli_args(parser, tmp_path, retrieval="hybrid", format="text")
+    args.allow_hybrid_text_fallback = True
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "WARNING: retrieval degraded to text (semantic_provider_failure)" in output
+    assert "text-id" in output
+
+
 def test_log_rejects_traversal_identifier(tmp_path: Path) -> None:
     parser = agent_memory.build_parser()
     args = parser.parse_args(

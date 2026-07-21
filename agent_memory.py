@@ -120,6 +120,26 @@ class SearchResult:
         }
 
 
+@dataclass
+class RetrievalOutcome:
+    requested_mode: str
+    effective_mode: str
+    degraded: bool
+    reason_code: str | None
+    provider_fingerprint: str | None
+    results: list[SearchResult]
+
+    def as_dict(self) -> dict:
+        return {
+            "requested_mode": self.requested_mode,
+            "effective_mode": self.effective_mode,
+            "degraded": self.degraded,
+            "reason_code": self.reason_code,
+            "provider_fingerprint": self.provider_fingerprint,
+            "results": [result.as_dict() for result in self.results],
+        }
+
+
 @dataclass(frozen=True)
 class ProviderFingerprint:
     provider: str
@@ -2203,20 +2223,31 @@ def command_load(args: argparse.Namespace) -> int:
 
 
 def command_search(args: argparse.Namespace) -> int:
-    results = search_memories(
-        Path(args.root),
-        args.query,
-        mode=args.mode,
-        agent_id=args.agent_id,
-        session_id=args.session_id,
-        event_type=args.event_type,
-        since=args.since,
-        until=args.until,
-        limit=args.limit,
-    )
+    filters = {
+        "agent_id": args.agent_id,
+        "session_id": args.session_id,
+        "event_type": args.event_type,
+        "since": args.since,
+        "until": args.until,
+    }
+    root = Path(args.root)
+    if args.retrieval == "text":
+        results = search_memories(
+            root, args.query, mode=args.mode, limit=args.limit, **filters
+        )
+        outcome = None
+    else:
+        outcome = _retrieve_with_embeddings(root, args, filters)
+        results = outcome.results
     if args.format == "json":
-        print(json.dumps([result.as_dict() for result in results], indent=2))
+        payload = outcome.as_dict() if outcome else [result.as_dict() for result in results]
+        print(json.dumps(payload, indent=2))
         return 0
+    if outcome and outcome.degraded:
+        print(
+            f"WARNING: retrieval degraded to {outcome.effective_mode} "
+            f"({outcome.reason_code})"
+        )
     for result in results:
         safe_path = single_line_text(result.relative_path, max_chars=500)
         print(
@@ -2225,6 +2256,113 @@ def command_search(args: argparse.Namespace) -> int:
             f"{safe_path} | {result.matched_field} | {result.snippet}"
         )
     return 0
+
+
+def _semantic_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, sqlite3.DatabaseError) or str(exc) in {
+        "embedding_fingerprint_mismatch",
+        "embedding_coverage_incomplete",
+        "embedding_integrity_failed",
+    }:
+        return "semantic_integrity_failure"
+    return "semantic_provider_failure"
+
+
+def _retrieve_with_embeddings(
+    root: Path, args: argparse.Namespace, filters: dict
+) -> RetrievalOutcome:
+    if not args.ollama_endpoint or not args.ollama_model or args.embedding_cache != "local-private":
+        raise ValueError("semantic_configuration_required")
+    if args.allow_hybrid_text_fallback and args.retrieval != "hybrid":
+        raise ValueError("semantic_configuration_required")
+    if args.limit < 1 or args.limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    if args.retrieval == "hybrid" and args.limit > 470:
+        raise ValueError("hybrid_limit_exceeds_safe_bound")
+    try:
+        config = OllamaConfig(endpoint=args.ollama_endpoint, model=args.ollama_model)
+    except (TypeError, ValueError):
+        raise ValueError("semantic_configuration_required") from None
+
+    scope = AcceptanceScope.OPERATOR_EVALUATION
+    cache_policy = EmbeddingCachePolicy.LOCAL_PRIVATE
+    fingerprint = None
+    candidate_limit = 60 + (2 * args.limit)
+    try:
+        fingerprint = discover_ollama_fingerprint(
+            config, request_json=ollama_request_json
+        )
+
+        def embed_documents(texts: list[str]) -> list[list[float]]:
+            return embed_ollama(
+                texts,
+                purpose="document",
+                config=config,
+                fingerprint=fingerprint,
+                request_json=ollama_request_json,
+                acceptance_scope=scope,
+            )
+
+        def embed_query(texts: list[str]) -> list[list[float]]:
+            return embed_ollama(
+                texts,
+                purpose="query",
+                config=config,
+                fingerprint=fingerprint,
+                request_json=ollama_request_json,
+                acceptance_scope=scope,
+            )
+
+        sync_memory_embeddings(
+            root,
+            fingerprint,
+            embed_documents,
+            acceptance_scope=scope,
+            cache_policy=cache_policy,
+        )
+        semantic_results = search_semantic_documents(
+            root,
+            args.query,
+            fingerprint,
+            embed_query,
+            acceptance_scope=scope,
+            cache_policy=cache_policy,
+            limit=candidate_limit if args.retrieval == "hybrid" else args.limit,
+            **filters,
+        )
+    except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+        reason = _semantic_failure_reason(exc)
+        if args.retrieval != "hybrid" or not args.allow_hybrid_text_fallback:
+            raise ValueError(reason) from None
+        text_results = search_memories(
+            root, args.query, mode=args.mode, limit=args.limit, **filters
+        )
+        return RetrievalOutcome(
+            requested_mode="hybrid",
+            effective_mode="text",
+            degraded=True,
+            reason_code=reason,
+            provider_fingerprint=fingerprint.digest() if fingerprint else None,
+            results=text_results,
+        )
+
+    if args.retrieval == "hybrid":
+        text_results = search_memories(
+            root, args.query, mode=args.mode, limit=candidate_limit, **filters
+        )
+        results = reciprocal_rank_fusion(
+            [text_results, semantic_results], limit=args.limit
+        )
+    else:
+        results = semantic_results
+    return RetrievalOutcome(
+        requested_mode=args.retrieval,
+        effective_mode=args.retrieval,
+        degraded=False,
+        reason_code=None,
+        provider_fingerprint=fingerprint.digest(),
+        results=results,
+    )
 
 
 def command_index(args: argparse.Namespace) -> int:
@@ -2498,6 +2636,13 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--until", help="ISO timestamp upper bound")
     search_parser.add_argument("--limit", type=int, default=50)
     search_parser.add_argument("--mode", choices=["auto", "index", "scan"], default="auto")
+    search_parser.add_argument(
+        "--retrieval", choices=["text", "semantic", "hybrid"], default="text"
+    )
+    search_parser.add_argument("--ollama-endpoint")
+    search_parser.add_argument("--ollama-model")
+    search_parser.add_argument("--embedding-cache", choices=["local-private"])
+    search_parser.add_argument("--allow-hybrid-text-fallback", action="store_true")
     search_parser.add_argument("--format", choices=["text", "json"], default="text")
     search_parser.set_defaults(func=command_search)
 

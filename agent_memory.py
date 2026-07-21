@@ -2,14 +2,17 @@
 
 import argparse
 import datetime as dt
+import enum
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import uuid
@@ -19,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 try:
     import fcntl
@@ -28,7 +31,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 DEFAULT_ROOT = Path.home() / "opencode"
-MEMORY_INDEX_SCHEMA_VERSION = 2
+MEMORY_INDEX_SCHEMA_VERSION = 3
 SENSITIVE_PATTERNS = [
     re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._\-]+"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[A-Za-z0-9._\-]+"),
@@ -165,6 +168,44 @@ class OllamaConfig:
             raise ValueError("Ollama model must be an explicit bounded single-line value")
 
 
+@dataclass(frozen=True)
+class EncodedEmbedding:
+    data: bytes
+    dimensions: int
+    vector_hash: str
+
+
+class AcceptanceScope(enum.Enum):
+    OPERATOR_EVALUATION = "operator-evaluation"
+
+
+class EmbeddingCachePolicy(enum.Enum):
+    NO_STORE = "no-store"
+    LOCAL_PRIVATE = "local-private"
+
+
+def encode_embedding_vector(values: list[float]) -> EncodedEmbedding:
+    if (
+        not values
+        or len(values) > 65_536
+        or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values)
+    ):
+        raise ValueError("embedding vector must contain bounded numeric dimensions")
+    numeric = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in numeric):
+        raise ValueError("embedding vector values must be finite")
+    magnitude = math.sqrt(sum(value * value for value in numeric))
+    if not math.isfinite(magnitude) or magnitude <= 0:
+        raise ValueError("embedding vector magnitude must be finite and nonzero")
+    normalized = [value / magnitude for value in numeric]
+    data = struct.pack(f"<{len(normalized)}f", *normalized)
+    return EncodedEmbedding(
+        data=data,
+        dimensions=len(normalized),
+        vector_hash=hashlib.sha256(data).hexdigest(),
+    )
+
+
 def discover_ollama_fingerprint(
     config: OllamaConfig,
     *,
@@ -201,6 +242,43 @@ def discover_ollama_fingerprint(
     )
 
 
+def embed_ollama(
+    texts: list[str],
+    *,
+    purpose: str,
+    config: OllamaConfig,
+    fingerprint: ProviderFingerprint,
+    request_json: Callable[..., object],
+    acceptance_scope: AcceptanceScope,
+) -> list[list[float]]:
+    _require_model_embedding_scope(acceptance_scope)
+    if purpose not in {"document", "query"}:
+        raise ValueError("embedding purpose must be document or query")
+    if discover_ollama_fingerprint(config, request_json=request_json) != fingerprint:
+        raise ValueError("Ollama provider identity changed")
+    prefix = config.document_prefix if purpose == "document" else config.query_prefix
+    payload = request_json(
+        "POST",
+        f"{config.endpoint}/api/embed",
+        {
+            "model": config.model,
+            "input": [prefix + text for text in texts],
+            "truncate": False,
+        },
+        timeout=config.timeout_seconds,
+        max_bytes=config.max_response_bytes,
+        acceptance_scope=acceptance_scope,
+    )
+    if discover_ollama_fingerprint(config, request_json=request_json) != fingerprint:
+        raise ValueError("Ollama provider identity changed")
+    if not isinstance(payload, dict) or not isinstance(payload.get("embeddings"), list):
+        raise ValueError("Ollama embedding response is malformed")
+    vectors = payload["embeddings"]
+    if len(vectors) != len(texts) or not all(isinstance(vector, list) for vector in vectors):
+        raise ValueError("Ollama embedding response count is invalid")
+    return vectors
+
+
 class _RejectRedirects(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise HTTPError(newurl, code, "Ollama redirects are disabled", headers, fp)
@@ -208,6 +286,46 @@ class _RejectRedirects(HTTPRedirectHandler):
 
 def _build_ollama_opener():
     return build_opener(ProxyHandler({}), _RejectRedirects())
+
+
+def ollama_request_json(
+    method: str,
+    url: str,
+    payload: dict | None,
+    *,
+    timeout: float,
+    max_bytes: int,
+    opener=None,
+    acceptance_scope: AcceptanceScope | None = None,
+):
+    if method not in {"GET", "POST"}:
+        raise ValueError("unsupported Ollama HTTP method")
+    if timeout <= 0 or max_bytes < 1:
+        raise ValueError("Ollama request limits must be positive")
+    parsed = urlsplit(url)
+    try:
+        validate_ollama_endpoint(urlunsplit((parsed.scheme, parsed.netloc, "", "", "")))
+    except ValueError as exc:
+        raise ValueError("Ollama request URL must use an approved loopback endpoint") from exc
+    if parsed.path not in {"/api/version", "/api/tags", "/api/embed"} or parsed.query or parsed.fragment:
+        raise ValueError("Ollama request URL path is not approved")
+    if parsed.path == "/api/embed":
+        _require_model_embedding_scope(acceptance_scope)
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=headers, method=method)
+    selected_opener = opener or _build_ollama_opener()
+    with selected_opener.open(request, timeout=timeout) as response:
+        raw = response.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("Ollama response exceeds configured size limit")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Ollama returned malformed JSON") from exc
 
 
 def utc_now() -> dt.datetime:
@@ -913,6 +1031,30 @@ def _connect_memory_index(
                         message,
                         tokenize = 'unicode61'
                     );
+                    CREATE TABLE IF NOT EXISTS embedding_providers (
+                        fingerprint TEXT PRIMARY KEY,
+                        identity_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS document_embeddings (
+                        memory_uuid TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        dimensions INTEGER NOT NULL,
+                        vector BLOB NOT NULL,
+                        vector_hash TEXT NOT NULL,
+                        PRIMARY KEY(memory_uuid, fingerprint),
+                        FOREIGN KEY(memory_uuid) REFERENCES documents(memory_uuid) ON DELETE CASCADE,
+                        FOREIGN KEY(fingerprint) REFERENCES embedding_providers(fingerprint) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS query_embeddings (
+                        fingerprint TEXT NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        dimensions INTEGER NOT NULL,
+                        vector BLOB NOT NULL,
+                        vector_hash TEXT NOT NULL,
+                        PRIMARY KEY(fingerprint, input_hash),
+                        FOREIGN KEY(fingerprint) REFERENCES embedding_providers(fingerprint) ON DELETE CASCADE
+                    );
                     """
                 )
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
@@ -1132,10 +1274,21 @@ def _sync_memory_index_once(root: Path, *, reset: bool = False) -> dict:
                 continue
             connection.execute(
                 """
-                INSERT OR REPLACE INTO documents(
+                INSERT INTO documents(
                     memory_uuid, relative_path, content_hash, timestamp, agent, session,
                     event_type, title, summary, message, row_hash
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_uuid) DO UPDATE SET
+                    relative_path = excluded.relative_path,
+                    content_hash = excluded.content_hash,
+                    timestamp = excluded.timestamp,
+                    agent = excluded.agent,
+                    session = excluded.session,
+                    event_type = excluded.event_type,
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    message = excluded.message,
+                    row_hash = excluded.row_hash
                 """,
                 (
                     document.memory_uuid,
@@ -1189,6 +1342,347 @@ def sync_memory_index(root: Path) -> dict:
         result = _sync_memory_index_once(root, reset=True)
         result["recovered"] = True
         return result
+
+
+def _embedding_document_text(title: str, summary: str, message: str) -> str:
+    return f"{title}\n\n{summary}\n\n{message}"
+
+
+def _require_model_embedding_scope(acceptance_scope: AcceptanceScope | None) -> None:
+    if acceptance_scope is not AcceptanceScope.OPERATOR_EVALUATION:
+        raise ValueError("acceptance scope does not permit model-derived embeddings")
+
+
+def _require_embedding_cache_policy(cache_policy: EmbeddingCachePolicy) -> None:
+    if cache_policy is not EmbeddingCachePolicy.LOCAL_PRIVATE:
+        raise ValueError("embedding cache policy does not permit storage")
+
+
+def sync_memory_embeddings(
+    root: Path,
+    fingerprint: ProviderFingerprint,
+    embed_documents: Callable[[list[str]], list[list[float]]],
+    *,
+    acceptance_scope: AcceptanceScope,
+    cache_policy: EmbeddingCachePolicy,
+) -> dict:
+    _require_model_embedding_scope(acceptance_scope)
+    _require_embedding_cache_policy(cache_policy)
+    root = root.expanduser().resolve()
+    sync_memory_index(root)
+    fingerprint_digest = fingerprint.digest()
+    identity_json = json.dumps(fingerprint.__dict__, ensure_ascii=False, sort_keys=True)
+    with _connect_memory_index(root) as connection:
+        connection.execute(
+            """
+            INSERT INTO embedding_providers(fingerprint, identity_json) VALUES (?, ?)
+            ON CONFLICT(fingerprint) DO UPDATE SET identity_json = excluded.identity_json
+            """,
+            (fingerprint_digest, identity_json),
+        )
+        documents = connection.execute(
+            "SELECT memory_uuid, title, summary, message FROM documents ORDER BY memory_uuid"
+        ).fetchall()
+        existing = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                """
+                SELECT memory_uuid, input_hash, dimensions, vector, vector_hash
+                FROM document_embeddings WHERE fingerprint = ?
+                """,
+                (fingerprint_digest,),
+            )
+        }
+        unchanged = 0
+        pending = []
+        for memory_uuid, title, summary, message in documents:
+            text = _embedding_document_text(title, summary, message)
+            input_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            prior = existing.get(memory_uuid)
+            if (
+                prior is not None
+                and prior[0] == input_hash
+                and prior[1] > 0
+                and len(prior[2]) == prior[1] * 4
+                and hashlib.sha256(prior[2]).hexdigest() == prior[3]
+            ):
+                unchanged += 1
+            else:
+                pending.append((memory_uuid, text, input_hash, prior is not None))
+        vectors = embed_documents([item[1] for item in pending]) if pending else []
+        if len(vectors) != len(pending):
+            raise ValueError("embedding provider returned an invalid vector count")
+        added = updated = 0
+        for (memory_uuid, _, input_hash, existed), vector in zip(pending, vectors):
+            encoded = encode_embedding_vector(vector)
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO document_embeddings(
+                    memory_uuid, fingerprint, input_hash, dimensions, vector, vector_hash
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_uuid,
+                    fingerprint_digest,
+                    input_hash,
+                    encoded.dimensions,
+                    encoded.data,
+                    encoded.vector_hash,
+                ),
+            )
+            if existed:
+                updated += 1
+            else:
+                added += 1
+        removed = connection.execute(
+            """
+            DELETE FROM document_embeddings
+            WHERE fingerprint = ? AND memory_uuid NOT IN (SELECT memory_uuid FROM documents)
+            """,
+            (fingerprint_digest,),
+        ).rowcount
+        connection.commit()
+    return {"added": added, "updated": updated, "removed": removed, "unchanged": unchanged}
+
+
+def _encoded_embedding_is_valid(vector: bytes, dimensions: int, vector_hash: str) -> bool:
+    if dimensions < 1 or len(vector) != dimensions * 4:
+        return False
+    if hashlib.sha256(vector).hexdigest() != vector_hash:
+        return False
+    values = struct.unpack(f"<{dimensions}f", vector)
+    if not all(math.isfinite(value) for value in values):
+        return False
+    magnitude = math.sqrt(sum(value * value for value in values))
+    return math.isclose(magnitude, 1.0, rel_tol=1e-5, abs_tol=1e-6)
+
+
+def _memory_embedding_status_connection(
+    connection: sqlite3.Connection, fingerprint: ProviderFingerprint
+) -> dict:
+    fingerprint_digest = fingerprint.digest()
+    expected_identity = json.dumps(fingerprint.__dict__, ensure_ascii=False, sort_keys=True)
+    provider = connection.execute(
+        "SELECT identity_json FROM embedding_providers WHERE fingerprint = ?",
+        (fingerprint_digest,),
+    ).fetchone()
+    documents = connection.execute(
+        "SELECT memory_uuid, title, summary, message FROM documents ORDER BY memory_uuid"
+    ).fetchall()
+    rows = connection.execute(
+        """
+        SELECT memory_uuid, input_hash, dimensions, vector, vector_hash
+        FROM document_embeddings WHERE fingerprint = ? ORDER BY memory_uuid
+        """,
+        (fingerprint_digest,),
+    ).fetchall()
+    base = {
+        "document_count": len(documents),
+        "vector_count": len(rows),
+        "fingerprint": fingerprint_digest,
+        "dimensions": None,
+    }
+    if provider is None or provider[0] != expected_identity:
+        return {"ok": False, "reason": "embedding_fingerprint_mismatch", **base}
+    if len(rows) != len(documents) or [row[0] for row in rows] != [row[0] for row in documents]:
+        return {"ok": False, "reason": "embedding_coverage_incomplete", **base}
+    dimensions = {row[2] for row in rows}
+    base["dimensions"] = next(iter(dimensions)) if len(dimensions) == 1 else None
+    for document, row in zip(documents, rows):
+        text = _embedding_document_text(*document[1:])
+        input_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if row[1] != input_hash or not _encoded_embedding_is_valid(row[3], row[2], row[4]):
+            return {"ok": False, "reason": "embedding_integrity_failed", **base}
+    if len(dimensions) != 1:
+        return {"ok": False, "reason": "embedding_integrity_failed", **base}
+    return {"ok": True, "reason": None, **base}
+
+
+def memory_embedding_status(root: Path, fingerprint: ProviderFingerprint) -> dict:
+    with _connect_memory_index(root, read_only=True, create=False) as connection:
+        return _memory_embedding_status_connection(connection, fingerprint)
+
+
+def get_or_create_query_embedding(
+    root: Path,
+    fingerprint: ProviderFingerprint,
+    query: str,
+    embed_query: Callable[[list[str]], list[list[float]]],
+    *,
+    acceptance_scope: AcceptanceScope,
+    cache_policy: EmbeddingCachePolicy,
+) -> EncodedEmbedding:
+    _require_model_embedding_scope(acceptance_scope)
+    _require_embedding_cache_policy(cache_policy)
+    if not query or len(query) > 32_768 or re.search(r"[\x00]", query):
+        raise ValueError("semantic query must be non-empty, bounded, and contain no NUL")
+    fingerprint_digest = fingerprint.digest()
+    input_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    identity_json = json.dumps(fingerprint.__dict__, ensure_ascii=False, sort_keys=True)
+    with _connect_memory_index(root) as connection:
+        connection.execute(
+            """
+            INSERT INTO embedding_providers(fingerprint, identity_json) VALUES (?, ?)
+            ON CONFLICT(fingerprint) DO UPDATE SET identity_json = excluded.identity_json
+            """,
+            (fingerprint_digest, identity_json),
+        )
+        row = connection.execute(
+            """
+            SELECT dimensions, vector, vector_hash FROM query_embeddings
+            WHERE fingerprint = ? AND input_hash = ?
+            """,
+            (fingerprint_digest, input_hash),
+        ).fetchone()
+        if row is not None and _encoded_embedding_is_valid(row[1], row[0], row[2]):
+            return EncodedEmbedding(data=row[1], dimensions=row[0], vector_hash=row[2])
+        vectors = embed_query([query])
+        if len(vectors) != 1:
+            raise ValueError("embedding provider returned an invalid query vector count")
+        encoded = encode_embedding_vector(vectors[0])
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO query_embeddings(
+                fingerprint, input_hash, dimensions, vector, vector_hash
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                fingerprint_digest,
+                input_hash,
+                encoded.dimensions,
+                encoded.data,
+                encoded.vector_hash,
+            ),
+        )
+        connection.commit()
+        return encoded
+
+
+def search_semantic_documents(
+    root: Path,
+    query: str,
+    fingerprint: ProviderFingerprint,
+    embed_query: Callable[[list[str]], list[list[float]]],
+    *,
+    acceptance_scope: AcceptanceScope,
+    cache_policy: EmbeddingCachePolicy,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+) -> list[SearchResult]:
+    _require_model_embedding_scope(acceptance_scope)
+    _require_embedding_cache_policy(cache_policy)
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    if agent_id:
+        agent_id = validate_identifier(agent_id, "agent id")
+    if session_id:
+        session_id = validate_identifier(session_id, "session id")
+    if event_type:
+        event_type = validate_identifier(event_type, "event type")
+    since_value = parse_timestamp(since, "since timestamp") if since else None
+    until_value = parse_timestamp(until, "until timestamp") if until else None
+    if since_value and until_value and since_value > until_value:
+        raise ValueError("since timestamp must not be after until timestamp")
+    status = memory_embedding_status(root, fingerprint)
+    if not status["ok"]:
+        raise ValueError(status["reason"])
+    query_vector = get_or_create_query_embedding(
+        root,
+        fingerprint,
+        query,
+        embed_query,
+        acceptance_scope=acceptance_scope,
+        cache_policy=cache_policy,
+    )
+    with _connect_memory_index(root, read_only=True, create=False) as connection:
+        status = _memory_embedding_status_connection(connection, fingerprint)
+        if not status["ok"]:
+            raise ValueError(status["reason"])
+        if query_vector.dimensions != status["dimensions"]:
+            raise ValueError("embedding_integrity_failed")
+        query_values = struct.unpack(f"<{query_vector.dimensions}f", query_vector.data)
+        rows = connection.execute(
+            """
+            SELECT d.timestamp, d.memory_uuid, d.agent, d.session, d.event_type,
+                   d.relative_path, d.title, d.summary, d.message,
+                   e.dimensions, e.vector
+            FROM documents AS d
+            JOIN document_embeddings AS e USING(memory_uuid)
+            WHERE e.fingerprint = ?
+            """,
+            (fingerprint.digest(),),
+        ).fetchall()
+    results = []
+    for timestamp, memory_uuid, agent, session, kind, path, title, summary, message, dims, vector in rows:
+        if agent_id and agent != agent_id:
+            continue
+        if session_id and session != session_id:
+            continue
+        if event_type and kind != event_type:
+            continue
+        timestamp_value = parse_timestamp(timestamp)
+        if since_value and timestamp_value < since_value:
+            continue
+        if until_value and timestamp_value > until_value:
+            continue
+        if dims != query_vector.dimensions:
+            raise ValueError("embedding_integrity_failed")
+        document_values = struct.unpack(f"<{dims}f", vector)
+        score = sum(left * right for left, right in zip(query_values, document_values))
+        results.append(
+            SearchResult(
+                timestamp=timestamp,
+                memory_uuid=memory_uuid,
+                agent=agent,
+                session=session,
+                event_type=kind,
+                relative_path=path,
+                matched_field="semantic",
+                snippet=single_line_text(message or summary or title),
+                score=score,
+            )
+        )
+    results.sort(key=lambda item: (parse_timestamp(item.timestamp), item.memory_uuid), reverse=True)
+    results.sort(key=lambda item: -item.score)
+    return results[:limit]
+
+
+def reciprocal_rank_fusion(
+    rankings: list[list[SearchResult]], *, k: int = 60, limit: int = 50
+) -> list[SearchResult]:
+    if k < 1 or limit < 1 or limit > 1000:
+        raise ValueError("RRF k and limit must be positive and limit at most 1000")
+    scores: dict[str, float] = {}
+    representatives: dict[str, SearchResult] = {}
+    for ranking in rankings:
+        seen = set()
+        for rank, item in enumerate(ranking, start=1):
+            if item.memory_uuid in seen:
+                continue
+            seen.add(item.memory_uuid)
+            scores[item.memory_uuid] = scores.get(item.memory_uuid, 0.0) + 1.0 / (k + rank)
+            representatives.setdefault(item.memory_uuid, item)
+    fused = [
+        SearchResult(
+            timestamp=item.timestamp,
+            memory_uuid=item.memory_uuid,
+            agent=item.agent,
+            session=item.session,
+            event_type=item.event_type,
+            relative_path=item.relative_path,
+            matched_field="hybrid",
+            snippet=item.snippet,
+            score=scores[memory_uuid],
+        )
+        for memory_uuid, item in representatives.items()
+    ]
+    fused.sort(key=lambda item: (parse_timestamp(item.timestamp), item.memory_uuid), reverse=True)
+    fused.sort(key=lambda item: -item.score)
+    return fused[:limit]
 
 
 def rebuild_memory_index(root: Path) -> dict:

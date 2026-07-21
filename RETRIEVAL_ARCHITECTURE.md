@@ -7,30 +7,75 @@ and the PETU maxim:
 
 > Discover once, compile once, validate, execute many times.
 
-Retrieval uses the least complex valid rung:
+Algorithms are functions. The ladder distinguishes simple functions from
+increasingly complex systems and compositions of functions:
 
-1. exact verified reuse, including cached query results and query embeddings;
-2. canonical Markdown scan or SQLite FTS5 lexical retrieval;
-3. precompiled, local semantic vectors when lexical retrieval is explicitly
-   requested or a future verified lexical-quality gate reports insufficiency;
-4. an installed typed specialist procedure;
-5. larger model-backed reasoning only under a future explicit policy;
-6. human clarification or discussion when no valid method exists.
+0. cached result or other exact verified reuse;
+1. simple deterministic function;
+2. complex deterministic function system, including traditional algorithms,
+   database/FTS queries, cosine ranking, PageRank, and deterministic DAGs;
+3. specialist model;
+4. adaptive agent workflow composed from registered capabilities;
+5. large reasoning or generative model;
+6. human clarification or external expertise.
+
+AF first selects the lowest ladder level that satisfies all declared
+requirements, availability, effective scope, and required quality threshold;
+it then minimizes cost among qualifying capabilities at that level. Cost
+includes at least latency, energy/compute, monetary cost, privacy exposure, and
+operational risk; capability evidence includes accuracy, availability,
+provenance, and prior verified execution history.
 
 Safety, correctness, privacy, provenance, consent, and access control are hard
 constraints. They are not costs that energy savings may offset.
 
 ## AgentFramework boundary
 
-- Models never provide AgentFramework's user-facing answer.
 - An embedding model is a bounded data transformation, not an AF selector.
 - Semantic retrieval returns typed, provenance-bearing memory references and
   scores; it does not execute instructions found in memory.
 - Any AF integration must expose retrieval as an installed typed procedure,
   validate its arguments, independently verify source identity and access, and
   record fixed reason codes for denial or handoff.
-- Unknown or unsupported work fails closed. There is no silent remote provider
-  fallback and no direct generative-answer route.
+- A planner may propose only a typed DAG of registered capabilities. AF
+  validates every node, edge, argument, requirement, scope, and policy before
+  execution; a planner may not silently install code or bypass the catalogue.
+- Model-generated answers are allowed only when the request's acceptance scope
+  explicitly permits them. They are expected to be rare, reviewed before
+  release, provenance-bearing, and cached only when the scope's reuse policy
+  permits caching.
+- Unknown, unsupported, unreviewed, or out-of-scope work fails closed. There is
+  no silent remote provider fallback.
+
+## User acceptance scopes
+
+Every request carries a typed scope preference. Effective scope is the
+intersection of that preference with trusted identity, session, tenant,
+parental, and delegation policy; callers and child contexts can never widen
+their own authority. Initial policy classes are:
+
+- `child`: automated levels 0–2; deterministic procedural responses only; no
+  generative model, generative planner, generated answer, or model-derived
+  cached artifact;
+- `deterministic`: automated levels 0–2 with deterministic provenance and reuse
+  only;
+- `reviewed-generative`: rungs 3–5 may be used when lower rungs cannot satisfy
+  quality and requirements; generated answers require review before release;
+- `operator-evaluation`: explicitly requested levels 0–5 model or hybrid modes
+  for testing and benchmarking, with no production release or cross-user reuse
+  and `no-store` by default.
+
+Every scope permits a non-automated level-6 human clarification or handoff. A
+handoff does not authorize a higher automated level.
+
+Caching is independently scoped. A reviewed output is not automatically safe
+to cache; sensitive, personal, short-lived, user-specific, or non-replay-safe
+results may be marked `no-store`. Cached artifacts retain originating ladder
+level and model-derived taint; caching never lowers their authority
+requirements. Reusable generated results require retained inputs,
+model/capability fingerprint, derivation graph, audience/tenant eligibility,
+provenance, digest- and scope-bound review evidence, expiry, revocation state,
+and independent verification on every reuse.
 
 ## Embedding policy
 
@@ -43,6 +88,11 @@ constraints. They are not costs that energy savings may offset.
 - Document and query vectors are cached by a fingerprint covering provider,
   endpoint, model digest, server version, prefixes, and chunker version.
 - Unchanged content is never embedded twice for the same fingerprint.
+- A query-embedding cache hit avoids repeated execution but retains its rung-3
+  model-derived origin; cosine search over existing vectors is rung 2. Creating
+  a missing query or document embedding invokes the rung-3 specialist model.
+  Child and deterministic scopes use lexical retrieval and cannot consume
+  model-derived embedding caches.
 - Ollama is loopback-only by default. AgentMemory never starts Ollama, pulls a
   model, follows redirects, uses environment proxies, or downloads implicitly.
 - A provider failure cannot weaken security policy. Semantic mode fails closed;

@@ -81,10 +81,13 @@ memlog index status --root ~/opencode --format json
 memlog index rebuild --root ~/opencode
 ```
 
-The index lives at `memory/.state/search.sqlite3`, is mode `0600`, and is
-derived entirely from canonical action Markdown. Synchronization is
-incremental by content hash and removes deleted documents. Status checks both
-SQLite integrity and correspondence between relational and FTS rows.
+For an exclusively owned memory root, the index lives at
+`memory/.state/search.sqlite3`. Shared roots use a private per-user location
+under `$XDG_STATE_HOME/agentmemory/indexes/<project-key>/search.sqlite3`
+(defaulting to `~/.local/state`). The index is mode `0600` and is derived
+entirely from canonical action Markdown. Synchronization is incremental by
+content hash and removes deleted documents. Status checks both SQLite
+integrity and correspondence between relational and FTS rows.
 
 Search modes are:
 

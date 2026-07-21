@@ -157,6 +157,11 @@ Markdown action documents remain authoritative. Search databases, embeddings,
 profiles, and graph scores are disposable projections that must be rebuildable
 from those documents.
 
+The execution order and AgentFramework integration boundary are defined in
+[Retrieval Architecture](RETRIEVAL_ARCHITECTURE.md). Deterministic text
+retrieval remains first and model-backed embeddings never produce user-facing
+answers.
+
 Planned incremental layers are:
 
 1. ~~SQLite FTS5 catalog with direct-scan fallback.~~

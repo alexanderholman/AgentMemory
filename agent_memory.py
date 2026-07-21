@@ -524,46 +524,90 @@ def search_action_documents(
     return results[:limit]
 
 
+def _directory_owned_by_current_user(path: Path) -> bool:
+    if path.is_symlink():
+        raise ValueError(f"refusing symlinked memory index directory: {path}")
+    if path.exists():
+        details = path.stat()
+        return details.st_uid == os.geteuid() and details.st_mode & 0o022 == 0
+    return False
+
+
+def _local_index_allowed(root: Path) -> bool:
+    for path in (root, root / "memory", root / "memory" / ".state"):
+        if path.is_symlink():
+            raise ValueError(f"refusing symlinked memory index directory: {path}")
+        if path.exists() and not _directory_owned_by_current_user(path):
+            return False
+    return True
+
+
+def _project_identity(root: Path) -> str:
+    root = root.expanduser().resolve()
+    details = root.stat()
+    payload = f"{root.as_posix()}\0{details.st_dev}\0{details.st_ino}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@contextmanager
+def _stable_project_root(root: Path):
+    canonical_root = root.expanduser().resolve()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(canonical_root, flags)
+    try:
+        details = os.fstat(descriptor)
+        payload = (
+            f"{canonical_root.as_posix()}\0{details.st_dev}\0{details.st_ino}"
+        ).encode("utf-8")
+        identity = hashlib.sha256(payload).hexdigest()
+        yield _stable_directory_path(descriptor), canonical_root, identity
+    finally:
+        os.close(descriptor)
+
+
+def _index_directory_path(root: Path) -> Path:
+    root = root.expanduser().resolve()
+    local_state = root / "memory" / ".state"
+    if local_state.is_symlink():
+        raise ValueError(f"refusing symlinked memory index directory: {local_state}")
+    if _local_index_allowed(root):
+        return local_state
+    configured_state = os.environ.get("XDG_STATE_HOME", "")
+    state_home = Path(configured_state).expanduser() if configured_state else Path.home() / ".local" / "state"
+    if not state_home.is_absolute():
+        state_home = Path.home() / ".local" / "state"
+    project_key = hashlib.sha256(root.as_posix().encode("utf-8")).hexdigest()[:24]
+    return state_home / "agentmemory" / "indexes" / project_key
+
+
 def memory_index_path(root: Path) -> Path:
-    return root.expanduser().resolve() / "memory" / ".state" / "search.sqlite3"
+    return _index_directory_path(root) / "search.sqlite3"
 
 
 @contextmanager
 def _secure_index_directory(root: Path):
-    root = root.expanduser().resolve()
+    directory = _index_directory_path(root)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    root_descriptor = os.open(root, flags)
-    memory_descriptor = None
-    state_descriptor = None
+    descriptor = os.open("/", flags)
     try:
-        for parent_descriptor, name in ((root_descriptor, "memory"),):
+        for name in directory.parts[1:]:
             try:
-                os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+                os.mkdir(name, 0o700, dir_fd=descriptor)
             except FileExistsError:
                 pass
-        try:
-            memory_descriptor = os.open("memory", flags, dir_fd=root_descriptor)
-        except (NotADirectoryError, OSError) as exc:
-            raise ValueError("refusing symlinked memory index directory: memory") from exc
-        try:
-            os.mkdir(".state", 0o700, dir_fd=memory_descriptor)
-        except FileExistsError:
-            pass
-        try:
-            state_descriptor = os.open(".state", flags, dir_fd=memory_descriptor)
-        except (NotADirectoryError, OSError) as exc:
-            raise ValueError("refusing symlinked memory index directory: .state") from exc
-        details = os.fstat(state_descriptor)
+            try:
+                child_descriptor = os.open(name, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise ValueError(f"refusing unsafe memory index directory component: {name}") from exc
+            os.close(descriptor)
+            descriptor = child_descriptor
+        details = os.fstat(descriptor)
         if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.geteuid():
             raise ValueError("memory index directory is not private and owned")
-        os.fchmod(state_descriptor, 0o700)
-        yield state_descriptor
+        os.fchmod(descriptor, 0o700)
+        yield descriptor
     finally:
-        if state_descriptor is not None:
-            os.close(state_descriptor)
-        if memory_descriptor is not None:
-            os.close(memory_descriptor)
-        os.close(root_descriptor)
+        os.close(descriptor)
 
 
 def _validate_index_entry(directory_fd: int, name: str) -> os.stat_result | None:
@@ -596,6 +640,8 @@ def _is_sqlite_corruption(exc: BaseException) -> bool:
         "no such table",
         "file is encrypted",
         "schema migration required",
+        "corruption found",
+        "project identity mismatch",
     )
     return any(marker in str(exc).lower() for marker in markers)
 
@@ -617,7 +663,12 @@ def _remove_index_files(root: Path) -> None:
 
 @contextmanager
 def _connect_memory_index(
-    root: Path, *, read_only: bool = False, create: bool = True, reset: bool = False
+    root: Path,
+    *,
+    read_only: bool = False,
+    create: bool = True,
+    reset: bool = False,
+    expected_project_identity: str | None = None,
 ):
     with _secure_index_directory(root) as directory_fd:
         original = _validate_index_entry(directory_fd, "search.sqlite3")
@@ -709,6 +760,7 @@ def _connect_memory_index(
         try:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = DELETE")
+            expected_project_identity = expected_project_identity or _project_identity(root)
             if not read_only:
                 connection.executescript(
                     """
@@ -741,11 +793,26 @@ def _connect_memory_index(
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
                 if "row_hash" not in columns:
                     raise sqlite3.DatabaseError("schema migration required")
+                identity_row = connection.execute(
+                    "SELECT value FROM index_meta WHERE key = 'project_identity'"
+                ).fetchone()
+                if identity_row and identity_row[0] != expected_project_identity:
+                    raise sqlite3.DatabaseError("project identity mismatch")
                 connection.execute(
                     "INSERT OR REPLACE INTO index_meta(key, value) VALUES('schema_version', ?)",
                     (str(MEMORY_INDEX_SCHEMA_VERSION),),
                 )
+                connection.execute(
+                    "INSERT OR REPLACE INTO index_meta(key, value) VALUES('project_identity', ?)",
+                    (expected_project_identity,),
+                )
                 connection.commit()
+            else:
+                identity_row = connection.execute(
+                    "SELECT value FROM index_meta WHERE key = 'project_identity'"
+                ).fetchone()
+                if not identity_row or identity_row[0] != expected_project_identity:
+                    raise ValueError("project identity mismatch")
             yield connection
             successful = True
         finally:
@@ -893,8 +960,13 @@ def _check_fts_integrity(connection: sqlite3.Connection) -> None:
 
 
 def _sync_memory_index_once(root: Path, *, reset: bool = False) -> dict:
-    documents = _discover_index_documents(root)
-    with _connect_memory_index(root, reset=reset) as connection:
+    with _stable_project_root(root) as (stable_root, canonical_root, project_identity):
+        documents = _discover_index_documents(stable_root)
+    if _project_identity(canonical_root) != project_identity:
+        raise ValueError("project root changed during index discovery")
+    with _connect_memory_index(
+        canonical_root, reset=reset, expected_project_identity=project_identity
+    ) as connection:
         _check_fts_integrity(connection)
         existing = {
             row[0]: tuple(row[1:])
@@ -970,6 +1042,8 @@ def _sync_memory_index_once(root: Path, *, reset: bool = False) -> dict:
         connection.execute(
             "DELETE FROM documents_fts WHERE memory_uuid NOT IN (SELECT memory_uuid FROM documents)"
         )
+        if _project_identity(canonical_root) != project_identity:
+            raise ValueError("project root changed during index synchronization")
         connection.commit()
     return {
         "added": added,

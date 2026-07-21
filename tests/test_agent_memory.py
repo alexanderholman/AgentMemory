@@ -725,7 +725,10 @@ def test_auto_search_falls_back_when_index_is_missing_or_corrupt(tmp_path: Path)
 def test_index_sync_recovers_from_corruption(tmp_path: Path) -> None:
     write_action(tmp_path, memory_uuid="recover-id", message="recoverable memory")
     index_path = agent_memory.memory_index_path(tmp_path)
-    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(tmp_path / "memory", 0o700)
+    os.chmod(index_path.parent, 0o700)
+    index_path = agent_memory.memory_index_path(tmp_path)
     index_path.write_bytes(b"not sqlite")
 
     result = agent_memory.sync_memory_index(tmp_path)
@@ -1031,3 +1034,90 @@ def test_failed_post_replace_step_restores_corrupt_original(
     with pytest.raises(OSError, match="injected chmod failure"):
         agent_memory.sync_memory_index(tmp_path)
     assert index_path.read_bytes() == original
+
+
+def test_shared_memory_root_uses_private_per_user_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "shared-project"
+    write_action(root, memory_uuid="shared-id", message="shared root memory")
+    user_state = tmp_path / "user-state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(user_state))
+    monkeypatch.setattr(agent_memory, "_directory_owned_by_current_user", lambda path: False)
+
+    result = agent_memory.sync_memory_index(root)
+    index_path = agent_memory.memory_index_path(root)
+
+    assert result["added"] == 1
+    assert index_path.is_relative_to(user_state)
+    assert index_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_alternate_fts_corruption_message_is_recoverable() -> None:
+    error = sqlite3.DatabaseError("fts5: corruption found reading blob")
+    assert agent_memory._is_sqlite_corruption(error) is True
+
+
+def test_relative_xdg_state_home_is_ignored_for_shared_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    monkeypatch.setattr(agent_memory, "_directory_owned_by_current_user", lambda path: False)
+    monkeypatch.setenv("XDG_STATE_HOME", "relative-state")
+    assert agent_memory.memory_index_path(root).is_absolute()
+    assert "relative-state" not in agent_memory.memory_index_path(root).parts
+
+
+def test_symlinked_xdg_state_home_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    target = tmp_path / "target-state"
+    target.mkdir()
+    link = tmp_path / "state-link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(agent_memory, "_directory_owned_by_current_user", lambda path: False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(link))
+    with pytest.raises(ValueError, match="unsafe memory index directory component"):
+        agent_memory.sync_memory_index(root)
+    assert list(target.iterdir()) == []
+
+
+def test_external_index_is_bound_to_project_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    write_action(root, memory_uuid="old-project-id", message="old project memory")
+    user_state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(user_state))
+    monkeypatch.setattr(agent_memory, "_directory_owned_by_current_user", lambda path: False)
+    agent_memory.sync_memory_index(root)
+
+    old_root = tmp_path / "old-project"
+    root.rename(old_root)
+    write_action(root, memory_uuid="new-project-id", message="new project memory")
+    with pytest.raises(ValueError, match="project identity mismatch"):
+        agent_memory.search_indexed_documents(root, "old project")
+    recovered = agent_memory.sync_memory_index(root)
+    assert recovered["recovered"] is True
+    assert agent_memory.search_indexed_documents(root, "new project")[0].memory_uuid == "new-project-id"
+
+
+def test_sync_rejects_root_replacement_during_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    write_action(root, memory_uuid="old-id", message="old memory")
+    real_discover = agent_memory._discover_index_documents
+
+    def replace_after_discovery(stable_root: Path):
+        documents = real_discover(stable_root)
+        root.rename(tmp_path / "old-project")
+        write_action(root, memory_uuid="new-id", message="new memory")
+        return documents
+
+    monkeypatch.setattr(agent_memory, "_discover_index_documents", replace_after_discovery)
+    with pytest.raises(ValueError, match="project root changed"):
+        agent_memory.sync_memory_index(root)

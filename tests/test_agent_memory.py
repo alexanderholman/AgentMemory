@@ -276,7 +276,7 @@ def test_agent_index_is_keyed_by_stable_agent_id(
     assert (tmp_path / "memory" / "agents" / "pr.command.zordon.md").is_file()
 
 
-def test_agent_load_does_not_trust_unrelated_legacy_indexes(
+def test_agent_load_uses_master_index_for_legacy_history(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     legacy = tmp_path / "memory" / "agents" / "Zordon.md"
@@ -288,6 +288,8 @@ def test_agent_load_does_not_trust_unrelated_legacy_indexes(
         "[[actions/2026/07/legacy-id]] | legacy memory\n",
         encoding="utf-8",
     )
+    master = tmp_path / "memory" / "master.md"
+    master.write_text(legacy.read_text(encoding="utf-8").replace("# Agent Memory: Zordon", "# Master Memory"), encoding="utf-8")
     parser = agent_memory.build_parser()
     args = parser.parse_args(
         [
@@ -304,7 +306,8 @@ def test_agent_load_does_not_trust_unrelated_legacy_indexes(
     )
 
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out) == []
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["memory_uuid"] == "legacy-id"
 
 
 def test_search_preserves_markdown_headings_inside_message(tmp_path: Path) -> None:
@@ -455,3 +458,66 @@ def test_redaction_still_masks_long_token_like_values() -> None:
     redacted, touched = agent_memory.redact_text(token)
     assert redacted == "[REDACTED_TOKEN]"
     assert touched is True
+
+
+def test_redaction_masks_long_lowercase_alphabetic_token() -> None:
+    token = "abcdefghijklmnopqrstuvwxyzabcdefghijklmn"
+    redacted, touched = agent_memory.redact_text(token)
+    assert redacted == "[REDACTED_TOKEN]"
+    assert touched is True
+
+
+def test_agent_ids_cannot_collide_through_lossy_normalization(tmp_path: Path) -> None:
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        [
+            "log",
+            "--root",
+            str(tmp_path),
+            "--agent-id",
+            "victim!",
+            "--session-id",
+            "ses_test",
+            "--message",
+            "I will reject colliding identity",
+        ]
+    )
+    with pytest.raises(ValueError):
+        args.func(args)
+
+
+def test_search_never_treats_tool_output_as_full_message(tmp_path: Path) -> None:
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(
+        [
+            "log",
+            "--root",
+            str(tmp_path),
+            "--agent-id",
+            "pr.command.zordon",
+            "--session-id",
+            "ses_test",
+            "--message",
+            "I will record safe content",
+            "--tool-name",
+            "test",
+            "--tool-output",
+            "## Tool Outputs (summarized)\nneedle-only-in-tool-output",
+        ]
+    )
+    assert args.func(args) == 0
+    assert agent_memory.search_action_documents(tmp_path, "needle only tool output") == []
+
+
+def test_search_text_output_sanitizes_control_characters_in_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    original = write_action(tmp_path, memory_uuid="path-control-id", message="path needle")
+    original.rename(original.with_name("evil\nFORGED\x1b[31m.md"))
+    parser = agent_memory.build_parser()
+    args = parser.parse_args(["search", "path needle", "--root", str(tmp_path)])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "\nFORGED" not in output

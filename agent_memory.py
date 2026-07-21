@@ -134,13 +134,6 @@ def validate_identifier(value: str, label: str) -> str:
     return value
 
 
-def normalize_identifier(value: str, label: str) -> str:
-    if not value or value in {".", ".."} or re.search(r"[\\/\x00-\x1f\x7f]", value):
-        raise ValueError(f"{label} is empty or contains traversal characters")
-    normalized = safe_name(value)
-    return validate_identifier(normalized, label)
-
-
 def validate_display_name(value: str) -> str:
     if not value or len(value) > 200 or re.search(r"[\x00-\x1f\x7f]", value):
         raise ValueError("agent name must be a non-empty single-line value")
@@ -163,6 +156,11 @@ def single_line_text(value: str, max_chars: int = 280) -> str:
     if len(collapsed) > max_chars:
         return collapsed[: max_chars - 3] + "..."
     return collapsed or "(empty)"
+
+
+def escape_reserved_headings(value: str) -> str:
+    reserved = "Links|Summary|Full Message|Tool Outputs \\(summarized\\)|Raw Output Links"
+    return re.sub(rf"(?m)^## ({reserved})$", r"\\## \1", value)
 
 
 def wiki_link(path: Path, root: Path) -> str:
@@ -272,9 +270,10 @@ def redact_text(content: str) -> tuple[str, bool]:
     for token in matches:
         if token.count("-") >= 4:
             continue
-        if re.fullmatch(r"[A-Za-z/]+", token):
-            continue
-        if not re.search(r"[0-9+=_]", token):
+        if re.fullmatch(r"[A-Za-z]+", token):
+            if re.fullmatch(r"[A-Z][a-z]+(?:[A-Z][A-Za-z]+)+", token):
+                continue
+        elif not re.search(r"[0-9+=_]", token):
             continue
         redacted = redacted.replace(token, "[REDACTED_TOKEN]")
         touched = True
@@ -298,7 +297,7 @@ def _section(text: str, heading: str, end_heading: str) -> str:
     end_marker = f"\n## {end_heading}\n"
     if end_marker not in content:
         return ""
-    return content.rsplit(end_marker, 1)[0].strip()
+    return content.split(end_marker, 1)[0].strip()
 
 
 def read_canonical_file(path: Path, root: Path, max_bytes: int) -> tuple[str, str, int]:
@@ -405,11 +404,11 @@ def search_action_documents(
     if limit < 1 or limit > 1000:
         raise ValueError("limit must be between 1 and 1000")
     if agent_id:
-        agent_id = normalize_identifier(agent_id, "agent id")
+        agent_id = validate_identifier(agent_id, "agent id")
     if session_id:
-        session_id = normalize_identifier(session_id, "session id")
+        session_id = validate_identifier(session_id, "session id")
     if event_type:
-        event_type = normalize_identifier(event_type, "event type")
+        event_type = validate_identifier(event_type, "event type")
     since_value = parse_timestamp(since, "since timestamp") if since else None
     until_value = parse_timestamp(until, "until timestamp") if until else None
     if since_value and until_value and since_value > until_value:
@@ -423,20 +422,27 @@ def search_action_documents(
     field_order = {"title": 0, "summary": 1, "message": 2}
     scanned_files = 0
     scanned_bytes = 0
+    scanned_directories = 0
     for current_dir, dirs, files in os.walk(action_root, followlinks=False):
+        scanned_directories += 1
+        if scanned_directories > 10_000:
+            raise ValueError("search scan exceeds configured resource limits")
         dirs[:] = sorted(name for name in dirs if name != "raw")
         for filename in sorted(files):
             if not filename.endswith(".md"):
                 continue
             path = Path(current_dir) / filename
+            scanned_files += 1
+            try:
+                scanned_bytes += min(path.lstat().st_size, 1_000_001)
+            except OSError:
+                pass
+            if scanned_files > 10_000 or scanned_bytes > 50_000_000:
+                raise ValueError("search scan exceeds configured resource limits")
             try:
                 document = parse_action_document(path, root)
             except (OSError, UnicodeError, ValueError):
                 continue
-            scanned_files += 1
-            scanned_bytes += document.source_bytes
-            if scanned_files > 10_000 or scanned_bytes > 50_000_000:
-                raise ValueError("search scan exceeds configured resource limits")
             if agent_id and document.agent != agent_id:
                 continue
             if session_id and document.session != session_id:
@@ -554,10 +560,10 @@ def command_log(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     ensure_layout(root)
 
-    agent_id = normalize_identifier(args.agent_id, "agent id")
+    agent_id = validate_identifier(args.agent_id, "agent id")
     agent_name = validate_display_name(args.agent_name or agent_id)
-    session_id = normalize_identifier(args.session_id, "session id")
-    event_type = normalize_identifier(args.event_type, "event type")
+    session_id = validate_identifier(args.session_id, "session id")
+    event_type = validate_identifier(args.event_type, "event type")
     model = args.model or "unknown"
     provider = args.provider or "unknown"
     variant = args.variant or "unknown"
@@ -568,6 +574,8 @@ def command_log(args: argparse.Namespace) -> int:
 
     message_redacted, message_masked = redact_text(message)
     tool_redacted, tool_masked = redact_text(tool_output)
+    message_redacted = escape_reserved_headings(message_redacted)
+    tool_document_text = escape_reserved_headings(tool_redacted)
     any_redacted = message_masked or tool_masked
 
     state = load_state(root, session_id)
@@ -594,7 +602,7 @@ def command_log(args: argparse.Namespace) -> int:
     raw_link = ""
     raw_summary = ""
     if tool_redacted:
-        raw_summary = summarize(tool_redacted)
+        raw_summary = summarize(tool_document_text)
         should_write_raw = args.raw_mode == "always" or len(tool_redacted) > args.raw_threshold
         if should_write_raw:
             raw_file = raw_dir / f"{ts_compact}-{memory_uuid}.raw"
@@ -624,6 +632,7 @@ def command_log(args: argparse.Namespace) -> int:
     summary_text, summary_masked = redact_text(
         args.summary or summarize(message_redacted, max_lines=3, max_chars=280)
     )
+    summary_text = escape_reserved_headings(summary_text)
     any_redacted = any_redacted or title_masked or summary_masked
 
     tool_lines = "- none"
@@ -697,20 +706,30 @@ def command_load(args: argparse.Namespace) -> int:
     elif source == "agent":
         if not args.agent_id:
             raise SystemExit("--agent-id is required when --source agent")
-        path = root / "memory" / "agents" / f"{normalize_identifier(args.agent_id, 'agent id')}.md"
+        path = root / "memory" / "agents" / f"{validate_identifier(args.agent_id, 'agent id')}.md"
     else:
         if not args.session_id:
             raise SystemExit("--session-id is required when --source session")
-        path = root / "memory" / "sessions" / f"{normalize_identifier(args.session_id, 'session id')}.md"
+        path = root / "memory" / "sessions" / f"{validate_identifier(args.session_id, 'session id')}.md"
 
     entries = load_index_entries(path)
+    if source == "agent":
+        canonical_entries = entries
+        master_entries = load_index_entries(root / "memory" / "master.md")
+        entries = []
+        seen_memory_uuids: set[str] = set()
+        for entry in canonical_entries + master_entries:
+            if entry.memory_uuid in seen_memory_uuids:
+                continue
+            entries.append(entry)
+            seen_memory_uuids.add(entry.memory_uuid)
 
     if args.agent_id:
-        entries = [entry for entry in entries if entry.agent == normalize_identifier(args.agent_id, "agent id")]
+        entries = [entry for entry in entries if entry.agent == validate_identifier(args.agent_id, "agent id")]
     if args.session_id:
-        entries = [entry for entry in entries if entry.session == normalize_identifier(args.session_id, "session id")]
+        entries = [entry for entry in entries if entry.session == validate_identifier(args.session_id, "session id")]
     if args.event_type:
-        entries = [entry for entry in entries if entry.event_type == normalize_identifier(args.event_type, "event type")]
+        entries = [entry for entry in entries if entry.event_type == validate_identifier(args.event_type, "event type")]
 
     if args.since:
         entries = [entry for entry in entries if entry.timestamp >= args.since]
@@ -774,10 +793,11 @@ def command_search(args: argparse.Namespace) -> int:
         print(json.dumps([result.as_dict() for result in results], indent=2))
         return 0
     for result in results:
+        safe_path = single_line_text(result.relative_path, max_chars=500)
         print(
             f"{result.score:.1f} | {result.timestamp} | {result.memory_uuid} | "
             f"{result.agent} | {result.session} | {result.event_type} | "
-            f"{result.relative_path} | {result.matched_field} | {result.snippet}"
+            f"{safe_path} | {result.matched_field} | {result.snippet}"
         )
     return 0
 
